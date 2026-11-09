@@ -73,8 +73,10 @@ Le karaoké se lit dans la fenêtre :
   premier usage) calcule, toutes les 20 ms, la probabilité de chaque lettre dans la voix isolée, puis l'algorithme de
   Viterbi place chaque mot des paroles exactes à l'endroit où ses lettres sont entendues. Sur de la parole de synthèse
   dont l'heure de chaque mot est connue, l'écart médian mesuré est de 0,03 s (anglais) à 0,07 s (français).
-  Un symbole « joker » entre les vers absorbe la voix absente du texte (chœurs, rires, répétitions), et chaque vers
-  est cherché à ±4 s de la place que lui donnent les heures LRCLIB recalées sur les mots reconnus par Whisper.
+  Un symbole « joker » entre les vers absorbe la voix absente du texte (chœurs, rires, répétitions). Chaque vers est
+  cherché près des mots que Whisper y a entendus ; entre deux vers entendus, les heures LRCLIB ne servent que si
+  aucun passage n'a été coupé ou ajouté entre eux. Les vers que la version chantée ne contient pas (reprise
+  raccourcie, couplet coupé) sont **sautés** et ne s'affichent pas.
   Méthode de secours (modèle indisponible, ou résultat trop éloigné du minutage LRCLIB) : transcription par Whisper
   (whisper.cpp, modèle large-v3-turbo, ≈ 550 Mo) et alignement des mots exacts sur les mots reconnus (`src/align.rs`).
 

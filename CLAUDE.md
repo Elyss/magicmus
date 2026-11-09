@@ -73,21 +73,35 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
 - Minutage mot à mot : **alignement forcé MMS** (`src/forced.rs`, `setup::ensure_aligner`) — modèle ONNX fp16
   `tatsu020/mms-300m-fa-onnx` (CC-BY-NC 4.0, non commercial, signalé dans le README), entrée 16 kHz mono de la voix
   isolée (source − karaoké), sortie log-probabilités par trame de 20 ms sur 31 symboles (0 = vide, 4..30 = a–z et
-  apostrophe ; accents retirés), fenêtres de 15 s + 1 s de contexte, Viterbi CTC avec un **joker** gratuit entre
-  les vers (absorbe chœurs, rires, répétitions absentes du texte). **Guide** : si le résultat de secours contient
-  au moins 10 mots entendus par Whisper (`MIN_GUIDE_ANCHORS`), chaque vers est cherché à ±4 s de sa place
-  (`GUIDE_MARGIN_S`) ; sans guide, MMS se trompait de plusieurs dizaines de secondes sur Feel Good Inc. (LRC d'une
-  autre version, décalée de 17 à 40 s, et Whisper muet sur les 90 premières secondes). Résultat en cache dans
-  `emissions.bin`. Garde-fou `pipeline::agrees` : si plus de 30 % des vers démarrent à plus de 2,5 s de la méthode
-  de secours (Whisper + `align.rs`), c'est la méthode de secours qui est retenue.
-- Exactitude vérifiée sur parole de synthèse (System.Speech, heure exacte de chaque mot) :
-  `cargo run --release --example diag_paroles -- --tts <wav 16 kHz> <json {text, words:[{text,start}]}>` →
-  écart médian 0,03 s (en), 0,065 s (fr), toujours en retard, 100 % / 98 % ≤ 0,2 s. Sur chant, MMS place les mots
-  en moyenne 0,24 s après Whisper (dont les heures de jetons sont moins fiables) : pas de vérité terrain sur chant.
-  Test de robustesse : `tts_extra.ps1` (scratchpad, non versionné) fait dire des phrases absentes du texte ;
-  pire mot 3,9 s → 1,4 s (fr) et 1,2 s → 0,11 s (en) grâce au joker. `--mms --lignes` : relevé par vers ;
-  `--libre` : sans guide.
-  `--ecrire` refait paroles.json d'une chanson comme « Resynchroniser » (sauvegarde `paroles.avant-mms.json`).
+  apostrophe ; accents retirés), fenêtres de 15 s + 1 s de contexte, Viterbi CTC. Résultat en cache dans
+  `emissions.bin`. Trois mécanismes, chacun né d'un échec mesuré :
+  - **Joker** entre les vers (`STAR_LOGP` = −0,1 par trame) : absorbe chœurs, rires, répétitions hors texte.
+    Gratuit (comme ctc-forced-aligner), il grignotait la première lettre des vers ; plus cher (−0,5), il attirait
+    les vers non chantés sur la voix hors texte.
+  - **Guide** (`forced::guide_windows`) : mots Whisper appariés au texte **sans contrainte de temps**
+    (`align::match_verses`) ; vers « entendu » si ≥ 40 % de ses mots (et ≥ 2) le sont. Copies de vers semblables
+    (≥ 80 %, refrains/couplets repris) réattribuées par programmation dynamique pour garder l'écart voix − LRC
+    régulier, un repère incohérent pouvant être écarté (`reassign_copies`). Fenêtre ±4 s autour des vers entendus ;
+    entre deux repères, heures LRC interpolées si la durée LRC correspond à la durée entendue (±2,5 s), sinon
+    n'importe où entre eux ; avant/après les repères, LRC prolongé avec une marge de 4 s + 10 %.
+    Le recalage `align::recalibrate` n'est **pas** utilisé ici : il écarte les vers décalés de plus de 3 s du
+    décalage médian, ce qui ruinait les reprises raccourcies.
+  - **Saut de vers** (`SKIP_PER_LETTER` = 6 par lettre) : transition d'un joker au suivant ; un vers sauté n'est
+    pas affiché. Jamais pour un vers « sûr » (`Window::sung` : entendu, ou entre deux repères à durée LRC cohérente).
+    Un vers non sûr de 3 mots ou plus tassé à moins de 0,2 s par mot est aussi écarté. À 4, Gorillaz perdait
+    18 vers ; à 6 sans la règle « sûr », Complicated en perdait 3.
+  Cas de référence : Complicated (5NPBIwQyPWE, LRC conforme), Feel Good Inc. (HyHNuVaZJ-k, LRC d'une autre
+  version décalée de 17 à 40 s, Whisper muet 90 s), reprise de Something Just Like This (E5b3oBGjYK0, 2:25,
+  deux blocs du texte officiel coupés → 14 vers sautés sur 58). Garde-fou `pipeline::agrees` : méthode de secours
+  (Whisper + `align.rs`) si plus des deux tiers des vers sont sautés.
+- Exactitude vérifiée sur parole de synthèse (System.Speech, heure exacte de chaque mot ; scripts
+  `examples/tts/*.ps1`) : `cargo run --release --example diag_paroles -- --tts <wav 16 kHz> <json>` → écart médian
+  0,03 s (en), 0,065 s (fr), 100 % / 98 % ≤ 0,2 s. Variantes : `_extra` (phrases dites mais absentes du texte),
+  `_cut` (vers du texte jamais dits, ajoutés au champ `text` du JSON). Sur chant, pas de vérité terrain : les débuts
+  de mots tombent à ±0,02 s des attaques de la voix (`--mms`, ligne « mot − attaque »).
+  Diagnostic : `--mms --lignes` (relevé par vers : place, fenêtre du guide, entendu/sûr/sauté), `--libre` (sans
+  guide), `MAGICMUS_SKIP=<pénalité>|off`, `--structure` (vers LRC le plus proche de chaque groupe de mots entendus,
+  numéros seulement), `--ecrire` (refait paroles.json comme « Resynchroniser », sauvegarde `paroles.avant-mms.json`).
 - Whisper ne transcrit qu'environ 60 % des mots chantés (interjections, mots courts, répétitions manquent). Les mots
   non reconnus sont placés sur les **attaques de la voix** (`src/vocal.rs`, montées d'énergie de la voix isolée,
   conservées dans `attaques.json`) en début de vers et dans les longs intervalles, sinon répartis dans l'intervalle.

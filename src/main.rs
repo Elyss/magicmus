@@ -782,7 +782,7 @@ impl App {
                 }
                 ui.add(
                     egui::Label::new(th::t(
-                        "Le minutage de chaque mot vient de la reconnaissance vocale (Whisper, ≈ 550 Mo au premier usage).",
+                        "Chaque mot est calé sur la voix (Whisper et MMS, ≈ 1,2 Go au premier usage) ; les vers absents de la version chantée sont écartés.",
                         12.0,
                         W::Medium,
                         th::FAINT,

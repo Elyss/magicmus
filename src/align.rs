@@ -183,6 +183,35 @@ fn recalibrate(text: &[TextLine], rec: &[Word]) -> Vec<TextLine> {
         .collect()
 }
 
+/// Appariement des mots exacts sur les mots reconnus, sans aucune contrainte de temps
+/// (les heures LRC peuvent venir d'une autre version : reprise raccourcie, clip…).
+/// Une entrée par vers non vide, une par mot : l'indice du mot reconnu apparié.
+pub fn match_verses(text: &[TextLine], rec: &[Word]) -> Vec<Vec<Option<usize>>> {
+    let mut flat: Vec<(usize, String, Option<(f64, f64)>)> = Vec::new();
+    let mut out: Vec<Vec<Option<usize>>> = Vec::new();
+    for l in text {
+        let words: Vec<&str> = l.text.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+        for w in &words {
+            flat.push((out.len(), w.to_string(), None));
+        }
+        out.push(vec![None; words.len()]);
+    }
+    let rec_norm: Vec<String> = rec.iter().map(|w| normalize(&w.text)).collect();
+    let starts: Vec<usize> = out.iter().scan(0, |n, v| {
+        let i = *n;
+        *n += v.len();
+        Some(i)
+    }).collect();
+    for (i, j) in needleman_wunsch(&flat, rec, &rec_norm) {
+        let vi = flat[i].0;
+        out[vi][i - starts[vi]] = Some(j);
+    }
+    out
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     let n = v.len();

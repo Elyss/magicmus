@@ -386,24 +386,17 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
     let onsets = r.karaoke.map(|k| crate::vocal::load_or_compute(r.work_dir, k)).unwrap_or_default();
     let fallback = (text_synced || !recognized.is_empty()).then(|| align::align_with(&t, &recognized, r.duration, &onsets));
 
-    // Méthode principale : alignement forcé de chaque mot sur la voix (MMS). Le résultat
-    // de secours sert de guide (fenêtre de recherche de chaque vers) quand il s'appuie
-    // sur assez de mots réellement entendus par Whisper.
-    let anchored = fallback.as_ref().map_or(0, |fb| {
-        fb.iter()
-            .flat_map(|l| l.words.iter())
-            .filter(|w| recognized.iter().any(|r| (r.start - w.start).abs() < 1e-6))
-            .count()
-    });
-    let guide = fallback.as_deref().filter(|_| anchored >= MIN_GUIDE_ANCHORS);
-    let forced = r.karaoke.and_then(|k| forced_align(r.work_dir, k, &t, guide, emit));
+    // Méthode principale : alignement forcé de chaque mot sur la voix (MMS), chaque vers
+    // étant cherché près des mots que Whisper y a entendus (fenêtres du guide).
+    let guide = crate::forced::guide_windows(&t, &recognized);
+    let forced = r.karaoke.and_then(|k| forced_align(r.work_dir, k, &t, guide.as_deref(), emit));
     let result = match (forced, fallback) {
-        (Some(f), Some(fb)) if agrees(&f, &fb) => Some(lyrics_of(f)),
+        (Some(f), _) if agrees(&f, guide.as_deref()) => Some(lyrics_of(f.into_iter().flatten().collect())),
         (Some(_), Some(fb)) => {
             emit(Event::Log("Alignement forcé trop éloigné du minutage des paroles : méthode de secours".into()));
             Some(lyrics_of(fb))
         }
-        (Some(f), None) => Some(lyrics_of(f)),
+        (Some(f), None) => Some(lyrics_of(f.into_iter().flatten().collect())),
         (None, Some(fb)) => Some(lyrics_of(fb)),
         (None, None) => {
             emit(Event::Warning(
@@ -426,22 +419,30 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
 }
 
 /// Alignement forcé (MMS) : télécharge le modèle au premier usage, calcule ou relit
-/// les émissions de la voix, puis aligne chaque mot. `None` en cas d'échec.
+/// les émissions de la voix, puis aligne chaque mot. Un élément par vers non vide,
+/// `None` pour un vers que la voix ne chante pas. `None` en cas d'échec.
 fn forced_align(
     work_dir: &Path,
     karaoke: &Path,
     text: &[align::TextLine],
-    guide: Option<&[lyrics::Line]>,
+    guide: Option<&[crate::forced::Window]>,
     emit: &mut dyn FnMut(Event),
-) -> Option<Vec<lyrics::Line>> {
-    let res = (|| -> Result<Option<Vec<lyrics::Line>>> {
+) -> Option<Vec<Option<lyrics::Line>>> {
+    let res = (|| -> Result<Option<Vec<Option<lyrics::Line>>>> {
         let runtime = setup::ensure_onnxruntime(&mut setup_reporter(emit))?;
         let model = setup::ensure_aligner(&mut setup_reporter(emit))?;
         emit(Event::Stage("Alignement des paroles sur la voix".into()));
         let em = crate::forced::load_or_compute(work_dir, karaoke, &runtime, &model, &mut |p| {
             emit(Event::Progress(p))
         })?;
-        Ok(crate::forced::align_lines(text, &em, guide))
+        let verses = crate::forced::align_verses(text, &em, guide, Some(crate::forced::SKIP_PER_LETTER));
+        if let Some(v) = &verses {
+            let skipped = v.iter().filter(|l| l.is_none()).count();
+            if skipped > 0 {
+                emit(Event::Log(format!("{skipped} vers absents de la version chantée (non affichés)")));
+            }
+        }
+        Ok(verses)
     })();
     match res {
         Ok(lines) => lines,
@@ -452,20 +453,15 @@ fn forced_align(
     }
 }
 
-/// Garde-fou : l'alignement forcé et la méthode de secours doivent placer la plupart
-/// des vers au même endroit (sinon le texte ne correspond sans doute pas à la version
-/// chantée, et l'alignement forcé a pu se perdre).
-/// Nombre minimal de mots reconnus par Whisper dans le résultat de secours pour qu'il
-/// guide l'alignement forcé.
-const MIN_GUIDE_ANCHORS: usize = 10;
-
-fn agrees(forced: &[lyrics::Line], fallback: &[lyrics::Line]) -> bool {
-    let n = forced.len().min(fallback.len());
-    if n == 0 {
+/// Garde-fou : l'alignement forcé ne doit pas avoir écarté plus des deux tiers des
+/// vers (texte sans rapport avec la chanson, ou langue que le modèle ne sait pas
+/// lire). Avec un guide, les fenêtres empêchent déjà les vers de s'égarer.
+fn agrees(forced: &[Option<lyrics::Line>], guide: Option<&[crate::forced::Window]>) -> bool {
+    let sung = forced.iter().flatten().count();
+    if sung == 0 || sung * 3 < forced.len() {
         return false;
     }
-    let far = forced.iter().zip(fallback).filter(|(a, b)| (a.start() - b.start()).abs() > 2.5).count();
-    far * 10 <= n * 3
+    guide.is_none_or(|g| g.len() == forced.len())
 }
 
 fn spectral(o: &Options, pcm: &[f32], emit: &mut dyn FnMut(Event)) -> Vec<f32> {

@@ -154,30 +154,43 @@ pub fn tokens(word: &str) -> Vec<usize> {
 /// Symbole « joker » : absorbe sans pénalité tout ce qui n'est pas dans le texte
 /// (chœurs, rires, répétitions absentes des paroles, introduction parlée…).
 const STAR: usize = usize::MAX;
-/// Log-probabilité du joker sur une trame (0 : gratuit, comme ctc-forced-aligner).
-const STAR_LOGP: f32 = 0.0;
+/// Log-probabilité du joker sur une trame : faible coût, pour qu'il ne grignote pas les
+/// lettres bien entendues en bord de vers (gratuit, il retardait les débuts de vers),
+/// tout en restant bien moins cher que le blanc sur une voix hors texte.
+const STAR_LOGP: f32 = -0.1;
 
 /// Alignement de Viterbi CTC : renvoie, pour chaque mot, (début, fin, confiance) en
 /// secondes, ou `None` pour un mot sans lettre alignable.
 pub fn align_words(em: &Emissions, words: &[Vec<usize>]) -> Vec<Option<(f64, f64, f32)>> {
-    align_words_with_breaks(em, words, &[], &[])
+    align_words_with_breaks(em, words, &[], &[], &[])
 }
+
+/// Pénalité (log-probabilité, par lettre) pour sauter un vers entier : un vers dont les
+/// lettres s'entendent moins bien que cela en moyenne est jugé absent de la version
+/// chantée (reprise raccourcie, couplet coupé, paroles d'une autre version).
+pub const SKIP_PER_LETTER: f32 = 6.0;
+/// Vers non entendu par Whisper (3 mots ou plus) que l'alignement a dû tasser en moins
+/// de ce temps par mot : jugé absent de la version chantée.
+const MIN_S_PER_WORD: f64 = 0.2;
 
 /// Comme [`align_words`], avec un joker au début, à la fin et devant chaque mot dont
 /// l'indice figure dans `breaks` (débuts de vers) : la voix chantée hors du texte entre
 /// deux vers ne peut plus attirer les mots. `bounds` (vide, ou un par mot) : intervalle
-/// en secondes où les lettres du mot doivent se trouver.
+/// en secondes où les lettres du mot doivent se trouver. `skip` (vide, ou un par vers) :
+/// pénalité par lettre pour sauter ce vers entier (ses mots restent alors à `None`),
+/// `None` pour un vers qui ne peut pas être sauté.
 pub fn align_words_with_breaks(
     em: &Emissions,
     words: &[Vec<usize>],
     breaks: &[usize],
     bounds: &[(f64, f64)],
+    skip: &[Option<f32>],
 ) -> Vec<Option<(f64, f64, f32)>> {
     let stars = !breaks.is_empty();
     let mut seq = Vec::new();
     let mut owner = Vec::new();
     for (wi, w) in words.iter().enumerate() {
-        if stars && (wi == 0 || breaks.contains(&wi)) && seq.last() != Some(&STAR) {
+        if stars && (wi == 0 || breaks.contains(&wi)) {
             seq.push(STAR);
             owner.push(usize::MAX);
         }
@@ -201,27 +214,36 @@ pub fn align_words_with_breaks(
         .collect();
     let l = seq.len();
     let t_max = em.frames;
-    if l == 0 || t_max < l {
+    if l == 0 || t_max < 2 {
         return vec![None; words.len()];
     }
     // États : blanc, lettre 0, blanc, lettre 1, …, blanc (2L + 1).
     let s_max = 2 * l + 1;
     let label = |s: usize| if s % 2 == 0 { BLANK } else { seq[s / 2] };
+    // Saut de vers : d'un joker au joker suivant, avec la pénalité du vers sauté.
+    let mut jump: Vec<Option<(usize, f32)>> = vec![None; s_max];
+    if stars {
+        // Un joker devant chaque vers et un à la fin : le vers v va du joker v au joker v + 1.
+        let star_states: Vec<usize> = (0..l).filter(|&k| seq[k] == STAR).map(|k| 2 * k + 1).collect();
+        for (v, w) in star_states.windows(2).enumerate() {
+            if let Some(per_letter) = skip.get(v).copied().flatten() {
+                let letters = (w[1] - w[0]) / 2 - 1;
+                jump[w[1]] = Some((w[0], -per_letter * letters as f32));
+            }
+        }
+    }
     let neg = f32::NEG_INFINITY;
     let mut prev = vec![neg; s_max];
     let mut cur = vec![neg; s_max];
-    // Retour arrière : 0 = rester, 1 = depuis s-1, 2 = depuis s-2.
+    // Retour arrière : 0 = rester, 1 = depuis s-1, 2 = depuis s-2, 3 = saut de vers.
     let mut back = vec![0u8; t_max * s_max];
     prev[0] = em.at(0, BLANK);
     if allowed[0].0 == 0 {
         prev[1] = emit(0, seq[0]);
     }
     for t in 1..t_max {
-        // États atteignables : ni trop en avance, ni trop en retard pour finir.
-        let s_lo = (2 * l + 1).saturating_sub(2 * (t_max - t));
-        let s_hi = (2 * t + 2).min(s_max);
         cur.fill(neg);
-        for s in s_lo..s_hi {
+        for s in 0..s_max {
             if s % 2 == 1 && (t < allowed[s / 2].0 || t > allowed[s / 2].1) {
                 continue;
             }
@@ -234,6 +256,12 @@ pub fn align_words_with_breaks(
             if s >= 2 && s % 2 == 1 && seq[s / 2] != seq[s / 2 - 1] && prev[s - 2] > best {
                 best = prev[s - 2];
                 from = 2;
+            }
+            if let Some((ps, cost)) = jump[s] {
+                if prev[ps] + cost > best {
+                    best = prev[ps] + cost;
+                    from = 3;
+                }
             }
             if best > neg {
                 cur[s] = best + emit(t, label(s));
@@ -261,7 +289,10 @@ pub fn align_words_with_breaks(
             score[k] += emit(t, seq[k]).exp();
         }
         if t > 0 {
-            s -= back[t * s_max + s] as usize;
+            s = match back[t * s_max + s] {
+                3 => jump[s].map_or(s, |j| j.0),
+                d => s - d as usize,
+            };
         }
     }
     let mut out = vec![None; words.len()];
@@ -280,17 +311,224 @@ pub fn align_words_with_breaks(
     out
 }
 
-/// Marge autour du placement approximatif d'un vers (voir [`align_lines`]).
+/// Marge autour de la place attendue d'un vers dans le guide.
 pub const GUIDE_MARGIN_S: f64 = 4.0;
+/// Écart toléré entre la durée LRC et la durée entendue séparant deux vers repères
+/// pour que les heures LRC servent à placer les vers intermédiaires (sinon un passage
+/// a été coupé ou ajouté entre eux).
+const GUIDE_CONSISTENT_S: f64 = 2.5;
 
-/// Aligne des vers (texte exact) sur les émissions et renvoie les lignes horodatées.
-/// Les mots sans lettre alignable sont placés entre leurs voisins.
+/// Fenêtre de recherche d'un vers (secondes). `heard` : Whisper a entendu ce vers (au
+/// moins 40 % de ses mots). `sung` : vers certainement chanté — entendu, ou situé entre
+/// deux vers entendus séparés de la même durée que dans les paroles LRC (aucun passage
+/// coupé entre eux) ; il ne peut pas être sauté.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub lo: f64,
+    pub hi: f64,
+    pub heard: bool,
+    pub sung: bool,
+}
+
+/// Vers repère : au moins 40 % de ses mots (et deux, ou son mot unique) entendus par Whisper.
+#[derive(Clone, Copy)]
+struct Anchor {
+    start: f64,
+    end: f64,
+}
+
+/// Fenêtre de recherche de chaque vers non vide de `text`, d'après les mots reconnus
+/// par Whisper appariés au texte sans contrainte de temps (`align::match_verses`).
 ///
-/// `guide` : placement approximatif des mêmes vers (heures LRC recalées sur les mots
-/// reconnus). Chaque vers est alors cherché entre le début de son vers guide moins
-/// [`GUIDE_MARGIN_S`] et le début du vers guide suivant plus cette marge, ce qui évite
-/// qu'un refrain répété ou des chœurs l'attirent loin de sa place.
-pub fn align_lines(text: &[crate::align::TextLine], em: &Emissions, guide: Option<&[Line]>) -> Option<Vec<Line>> {
+/// - vers repère : autour des mots entendus ;
+/// - entre deux repères : à la place que donnent les heures LRC si la durée LRC entre
+///   les repères correspond à la durée entendue, sinon n'importe où entre eux (passage
+///   coupé ou ajouté : l'alignement forcé décide, et peut sauter le vers) ;
+/// - avant le premier ou après le dernier repère : heures LRC prolongées depuis le
+///   repère, avec une marge qui grandit avec la distance (10 %), sinon sans borne.
+///
+/// `None` s'il y a moins de trois vers repères.
+pub fn guide_windows(text: &[crate::align::TextLine], rec: &[crate::lyrics::Word]) -> Option<Vec<Window>> {
+    let matches = crate::align::match_verses(text, rec);
+    let lrc: Vec<Option<f64>> = text.iter().filter(|t| !t.text.trim().is_empty()).map(|t| t.start).collect();
+    let anchors: Vec<Option<Anchor>> = matches
+        .iter()
+        .map(|m| {
+            let hits: Vec<(usize, usize)> = m.iter().enumerate().filter_map(|(k, j)| j.map(|j| (k, j))).collect();
+            // Au moins deux mots (ou le mot unique) et 40 % du vers : deux mots courants
+            // appariés par hasard ne suffisent pas.
+            if hits.len() < 2.min(m.len()).max((m.len() * 2).div_ceil(5)) {
+                return None;
+            }
+            let (k0, j0) = hits[0];
+            let (k1, j1) = *hits.last().unwrap();
+            Some(Anchor {
+                start: (rec[j0].start - 0.3 * k0 as f64).max(0.0),
+                end: rec[j1].end + 0.3 * (m.len() - 1 - k1) as f64,
+            })
+        })
+        .collect();
+    if anchors.iter().flatten().count() < 3 {
+        return None;
+    }
+    let anchors = reassign_copies(text, &lrc, anchors);
+    let n = matches.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(a) = anchors[i] {
+            out.push(Window { lo: a.start - GUIDE_MARGIN_S, hi: a.end + GUIDE_MARGIN_S, heard: true, sung: true });
+            continue;
+        }
+        let p = (0..i).rev().find(|&k| anchors[k].is_some());
+        let q = (i + 1..n).find(|&k| anchors[k].is_some());
+        // Durée LRC du vers (jusqu'au suivant), pour la fin de fenêtre.
+        let span = |k: usize| match (lrc[k], lrc.get(k + 1).copied().flatten()) {
+            (Some(a), Some(b)) if b > a => (b - a).min(12.0),
+            _ => 4.0,
+        };
+        let mut sung = false;
+        let w = match (p, q) {
+            (Some(p), Some(q)) => {
+                let (ap, aq) = (anchors[p].unwrap(), anchors[q].unwrap());
+                match (lrc[p], lrc[i], lrc[q]) {
+                    (Some(lp), Some(li), Some(lq)) if lq > lp && ((aq.start - ap.start) - (lq - lp)).abs() <= GUIDE_CONSISTENT_S => {
+                        // Correspondance linéaire LRC → voix entre les deux repères.
+                        let e = ap.start + (li - lp) * (aq.start - ap.start) / (lq - lp);
+                        sung = true;
+                        (e - GUIDE_MARGIN_S, e + span(i) + GUIDE_MARGIN_S)
+                    }
+                    _ => (ap.end - GUIDE_MARGIN_S, aq.start + GUIDE_MARGIN_S),
+                }
+            }
+            (Some(p), None) => {
+                let ap = anchors[p].unwrap();
+                match (lrc[p], lrc[i]) {
+                    (Some(lp), Some(li)) if li >= lp => {
+                        let e = ap.start + (li - lp);
+                        let m = GUIDE_MARGIN_S + 0.1 * (li - lp);
+                        (e - m, e + span(i) + m)
+                    }
+                    _ => (ap.end - GUIDE_MARGIN_S, f64::INFINITY),
+                }
+            }
+            (None, Some(q)) => {
+                let aq = anchors[q].unwrap();
+                match (lrc[i], lrc[q]) {
+                    (Some(li), Some(lq)) if lq >= li => {
+                        let e = aq.start - (lq - li);
+                        let m = GUIDE_MARGIN_S + 0.1 * (lq - li);
+                        (e - m, e + span(i) + m)
+                    }
+                    _ => (0.0, aq.start + GUIDE_MARGIN_S),
+                }
+            }
+            (None, None) => (0.0, f64::INFINITY),
+        };
+        out.push(Window { lo: w.0, hi: w.1, heard: false, sung });
+    }
+    Some(out)
+}
+
+/// Vers identiques (refrains, couplets repris) : l'appariement mot à mot ne sait pas à
+/// quelle copie attribuer ce qu'il entend. On choisit, pour chaque vers repère, la copie
+/// (dans l'ordre du texte) qui garde l'écart voix − LRC le plus régulier d'un repère au
+/// suivant ; sans heures LRC, celle qui saute le moins de vers.
+fn reassign_copies(text: &[crate::align::TextLine], lrc: &[Option<f64>], anchors: Vec<Option<Anchor>>) -> Vec<Option<Anchor>> {
+    let norm: Vec<Vec<String>> = text
+        .iter()
+        .filter(|t| !t.text.trim().is_empty())
+        .map(|t| t.text.split_whitespace().map(crate::align::normalize).collect())
+        .collect();
+    let list: Vec<(usize, Anchor)> = anchors.iter().enumerate().filter_map(|(i, a)| a.map(|a| (i, a))).collect();
+    // Copies : vers semblables à 80 % au moins (plus longue sous-suite commune de mots).
+    let similar = |a: &[String], b: &[String]| {
+        let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                d[i + 1][j + 1] = if a[i] == b[j] { d[i][j] + 1 } else { d[i][j + 1].max(d[i + 1][j]) };
+            }
+        }
+        2 * d[a.len()][b.len()] * 10 >= 8 * (a.len() + b.len())
+    };
+    let cands: Vec<Vec<usize>> =
+        list.iter().map(|(i, _)| (0..norm.len()).filter(|&c| c == *i || similar(&norm[c], &norm[*i])).collect()).collect();
+    let timed = lrc.iter().all(Option::is_some);
+    // Coût d'un passage du repère kp (copie cp) au repère k (copie c).
+    let trans = |kp: usize, cp: usize, k: usize, c: usize| -> f64 {
+        if timed {
+            let off = list[k].1.start - lrc[c].unwrap();
+            let off_p = list[kp].1.start - lrc[cp].unwrap();
+            (off - off_p).abs()
+        } else {
+            (c - cp - 1) as f64
+        }
+    };
+    // Écarter un repère (mots appariés par erreur) coûte l'équivalent de 8 s d'écart.
+    const DROP: f64 = 8.0;
+    let m = list.len();
+    // Programmation dynamique : repères gardés, copies strictement croissantes.
+    let mut cost: Vec<Vec<f64>> = vec![];
+    let mut from: Vec<Vec<Option<(usize, usize)>>> = vec![];
+    for k in 0..m {
+        let mut ck = vec![f64::INFINITY; cands[k].len()];
+        let mut fk = vec![None; cands[k].len()];
+        for (ci, &c) in cands[k].iter().enumerate() {
+            ck[ci] = DROP * k as f64 + c as f64 * 1e-3;
+            for kp in 0..k {
+                for (pi, &cp) in cands[kp].iter().enumerate() {
+                    if cp < c && cost[kp][pi].is_finite() {
+                        let v = cost[kp][pi] + trans(kp, cp, k, c) + DROP * (k - kp - 1) as f64 + c as f64 * 1e-6;
+                        if v < ck[ci] {
+                            ck[ci] = v;
+                            fk[ci] = Some((kp, pi));
+                        }
+                    }
+                }
+            }
+        }
+        cost.push(ck);
+        from.push(fk);
+    }
+    let mut best: Option<(usize, usize, f64)> = None;
+    for k in 0..m {
+        for (ci, &v) in cost[k].iter().enumerate() {
+            let total = v + DROP * (m - 1 - k) as f64;
+            if best.is_none_or(|b| total < b.2) {
+                best = Some((k, ci, total));
+            }
+        }
+    }
+    let Some((mut k, mut ci, _)) = best else { return anchors };
+    let mut out = vec![None; anchors.len()];
+    loop {
+        out[cands[k][ci]] = Some(list[k].1);
+        match from[k][ci] {
+            Some((kp, pi)) => (k, ci) = (kp, pi),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Comme [`align_verses`] avec la pénalité de saut par défaut, sans les vers sautés.
+pub fn align_lines(text: &[crate::align::TextLine], em: &Emissions, guide: Option<&[Window]>) -> Option<Vec<Line>> {
+    align_verses(text, em, guide, Some(SKIP_PER_LETTER)).map(|v| v.into_iter().flatten().collect())
+}
+
+/// Aligne des vers (texte exact) sur les émissions : une entrée par vers non vide de
+/// `text`, `None` pour un vers que la voix ne chante pas (sauté, voir
+/// [`SKIP_PER_LETTER`]). Les mots sans lettre alignable sont placés entre leurs voisins.
+///
+/// `guide` : fenêtre de recherche de chaque vers non vide, voir [`guide_windows`] ;
+/// elle évite qu'un refrain répété ou des chœurs attirent un vers loin de sa place.
+/// `skip` : pénalité de saut par lettre (les vers certainement chantés, voir
+/// [`Window::sung`], ne sont jamais sautés).
+pub fn align_verses(
+    text: &[crate::align::TextLine],
+    em: &Emissions,
+    guide: Option<&[Window]>,
+    skip: Option<f32>,
+) -> Option<Vec<Option<Line>>> {
     let verses: Vec<Vec<String>> = text
         .iter()
         .map(|l| l.text.split_whitespace().map(String::from).collect::<Vec<_>>())
@@ -302,40 +540,73 @@ pub fn align_lines(text: &[crate::align::TextLine], em: &Emissions, guide: Optio
         return None;
     }
     // Débuts de vers : un joker les précède.
-    let breaks: Vec<usize> = verses.iter().scan(0, |n, v| { let i = *n; *n += v.len(); Some(i) }).collect();
+    let breaks: Vec<usize> = verses
+        .iter()
+        .scan(0, |n, v| {
+            let i = *n;
+            *n += v.len();
+            Some(i)
+        })
+        .collect();
+    let guide = guide.filter(|g| g.len() == verses.len());
     let mut bounds = Vec::new();
-    if let Some(g) = guide.filter(|g| g.len() == verses.len()) {
-        for (i, v) in verses.iter().enumerate() {
-            let lo = g[i].start() - GUIDE_MARGIN_S;
-            let end = g[i].words.last().map_or(g[i].start(), |w| w.end);
-            let hi = g.get(i + 1).map_or(end, |n| n.start().max(end)) + GUIDE_MARGIN_S;
-            bounds.extend(std::iter::repeat_n((lo, hi), v.len()));
+    if let Some(g) = guide {
+        for (v, w) in verses.iter().zip(g) {
+            bounds.extend(std::iter::repeat_n((w.lo, w.hi.min(1e7)), v.len()));
         }
     }
-    let mut times = align_words_with_breaks(em, &toks, &breaks, &bounds);
+    let sure = |v: usize| guide.is_some_and(|g| g[v].sung);
+    let skips: Vec<Option<f32>> = (0..verses.len()).map(|v| skip.filter(|_| !sure(v))).collect();
+    let mut times = align_words_with_breaks(em, &toks, &breaks, &bounds, &skips);
     if !bounds.is_empty() && times.iter().all(Option::is_none) {
         // Guide incompatible avec l'audio : alignement libre.
-        times = align_words_with_breaks(em, &toks, &breaks, &[]);
+        let free: Vec<Option<f32>> = vec![skip; verses.len()];
+        times = align_words_with_breaks(em, &toks, &breaks, &[], &free);
     }
     if times.iter().all(Option::is_none) {
         return None;
     }
-    // Mots sans lettre (chiffres, symboles…) : entre le mot précédent et le suivant.
-    let mut spans: Vec<(f64, f64)> = Vec::with_capacity(flat.len());
-    for (i, t) in times.iter().enumerate() {
-        match t {
-            Some((s, e, _)) => spans.push((*s, *e)),
-            None => {
-                let prev_end = spans.last().map_or(0.0, |p| p.1);
-                let next = times[i + 1..].iter().flatten().next().map_or(prev_end + 0.3, |n| n.0);
-                spans.push((prev_end, prev_end.max(next.min(prev_end + 0.3))));
-            }
-        }
-    }
-    let mut lines = Vec::with_capacity(verses.len());
+    // Vers chantés : au moins un mot placé (ou aucun mot alignable).
+    let mut sung = Vec::with_capacity(verses.len());
     let mut k = 0;
     for v in &verses {
-        let words = v
+        let r = k..k + v.len();
+        k += v.len();
+        sung.push(r.clone().all(|i| toks[i].is_empty()) || r.clone().any(|i| times[i].is_some()));
+    }
+    // Mots sans lettre (chiffres, symboles…) des vers chantés : entre le mot précédent
+    // et le suivant.
+    let mut spans: Vec<(f64, f64)> = vec![(0.0, 0.0); flat.len()];
+    let mut prev_end = 0.0;
+    let mut k = 0;
+    for (vi, v) in verses.iter().enumerate() {
+        for _ in v {
+            if sung[vi] {
+                spans[k] = match times[k] {
+                    Some((s, e, _)) => (s, e),
+                    None => {
+                        let next = times[k + 1..].iter().flatten().next().map_or(prev_end + 0.3, |n| n.0);
+                        (prev_end, f64::max(prev_end, next.min(prev_end + 0.3)))
+                    }
+                };
+                prev_end = spans[k].1;
+            }
+            k += 1;
+        }
+    }
+    // Vers tassés (non entendus par Whisper) : forcés là où ils ne sont pas chantés.
+    let mut k = 0;
+    for (vi, v) in verses.iter().enumerate() {
+        let (first, last) = (spans[k].0, spans[k + v.len() - 1].1);
+        if skip.is_some() && sung[vi] && !sure(vi) && v.len() >= 3 && last - first < MIN_S_PER_WORD * v.len() as f64 {
+            sung[vi] = false;
+        }
+        k += v.len();
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut k = 0;
+    for (vi, v) in verses.iter().enumerate() {
+        let words: Vec<Word> = v
             .iter()
             .map(|w| {
                 let (s, e) = spans[k];
@@ -343,10 +614,13 @@ pub fn align_lines(text: &[crate::align::TextLine], em: &Emissions, guide: Optio
                 Word { text: w.clone(), start: s, end: e.max(s + 0.08) }
             })
             .collect();
-        lines.push(Line { words });
+        if sung[vi] {
+            lines.push(Line { words });
+        }
     }
     crate::align::enforce_order(&mut lines);
-    Some(lines)
+    let mut it = lines.into_iter();
+    Some(sung.into_iter().map(|k| if k { it.next() } else { None }).collect())
 }
 
 /// Émissions d'une chanson : relues si déjà calculées, sinon calculées depuis la voix
@@ -415,5 +689,40 @@ mod tests {
         let (s1, e1, _) = r[1].unwrap();
         assert!((s0 - 0.20).abs() < 0.03 && (e0 - 0.40).abs() < 0.03, "{s0} {e0}");
         assert!((s1 - 1.00).abs() < 0.03 && (e1 - 1.20).abs() < 0.03, "{s1} {e1}");
+    }
+
+    /// Un vers absent de l'audio est sauté (sans saut, il est forcé quelque part) ; une
+    /// voix hors texte (« c ») n'attire pas les vers grâce au joker.
+    #[test]
+    fn vers_absent_saute() {
+        // Lettre absente : log-probabilité ≈ −8 par trame, comme sur une vraie voix.
+        let frames = 150;
+        let vocab = 31;
+        let (a, b, c, d) = (4usize, 20usize, 7usize, 9usize);
+        let mut logp = vec![(0.01f32).ln(); frames * vocab];
+        let mut set = |t: usize, k: usize| {
+            for j in 0..vocab {
+                logp[t * vocab + j] = if j == k { (0.99f32).ln() } else { (0.01f32 / 30.0).ln() };
+            }
+        };
+        for t in 0..frames {
+            set(t, BLANK);
+        }
+        // « ab » à 0,2 s, voix hors texte « c » à 1,0 s, « ba » à 2,0 s.
+        for t in 10..15 { set(t, a); }
+        for t in 15..20 { set(t, b); }
+        for t in 50..60 { set(t, c); }
+        for t in 100..105 { set(t, b); }
+        for t in 105..110 { set(t, a); }
+        let em = Emissions { frames, vocab, logp };
+        // Vers : « ab », « ddd » (jamais chanté), « ba ».
+        let words = [vec![a, b], vec![d, d, d], vec![b, a]];
+        let r = align_words_with_breaks(&em, &words, &[0, 1, 2], &[], &[Some(SKIP_PER_LETTER); 3]);
+        assert!(r[1].is_none(), "{:?}", r[1]);
+        assert!((r[0].unwrap().0 - 0.20).abs() < 0.03, "{r:?}");
+        assert!((r[2].unwrap().0 - 2.00).abs() < 0.03);
+        // Sans saut possible, le vers est placé de force.
+        let r = align_words_with_breaks(&em, &words, &[0, 1, 2], &[], &[]);
+        assert!(r[1].is_some());
     }
 }

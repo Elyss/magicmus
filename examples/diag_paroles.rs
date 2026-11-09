@@ -28,7 +28,9 @@ fn tts_check(wav: &str, json: &str) -> anyhow::Result<()> {
     let model = karaoke::setup::ensure_aligner(&mut prog)?;
     let em = karaoke::forced::emissions(&runtime, &model, &mono, &mut |_| {})?;
     let text_lines: Vec<align::TextLine> = text.lines().map(|l| align::TextLine { start: None, text: l.into() }).collect();
-    let lines = karaoke::forced::align_lines(&text_lines, &em, None).expect("alignement");
+    let verses = karaoke::forced::align_verses(&text_lines, &em, None, skip_setting()).expect("alignement");
+    let skipped = verses.iter().filter(|v| v.is_none()).count();
+    let lines: Vec<karaoke::lyrics::Line> = verses.into_iter().flatten().collect();
     let got: Vec<&karaoke::lyrics::Word> = lines.iter().flat_map(|l| l.words.iter()).collect();
     // Appariement dans l'ordre par mot normalisé.
     let mut diffs = Vec::new();
@@ -46,7 +48,7 @@ fn tts_check(wav: &str, json: &str) -> anyhow::Result<()> {
     signed.sort_by(f64::total_cmp);
     let within = |x: f64| abs.iter().filter(|e| **e <= x).count() as f64 * 100.0 / abs.len().max(1) as f64;
     println!(
-        "{} : {} mots comparés · écart médian {:.3} s (signé {:+.3} s) · ≤ 0,1 s : {:.0} % · ≤ 0,2 s : {:.0} % · max {:.2} s",
+        "{} : {} mots comparés, {skipped} vers sautés · écart médian {:.3} s (signé {:+.3} s) · ≤ 0,1 s : {:.0} % · ≤ 0,2 s : {:.0} % · max {:.2} s",
         std::path::Path::new(wav).file_name().unwrap().to_string_lossy(),
         abs.len(),
         abs[abs.len() / 2],
@@ -56,6 +58,15 @@ fn tts_check(wav: &str, json: &str) -> anyhow::Result<()> {
         abs.last().unwrap()
     );
     Ok(())
+}
+
+/// Pénalité de saut de vers : `MAGICMUS_SKIP=<valeur>` ou `off` (défaut : celle de l'application).
+fn skip_setting() -> Option<f32> {
+    match std::env::var("MAGICMUS_SKIP") {
+        Ok(v) if v == "off" => None,
+        Ok(v) => v.parse().ok(),
+        Err(_) => Some(karaoke::forced::SKIP_PER_LETTER),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -156,6 +167,36 @@ fn main() -> anyhow::Result<()> {
     };
     println!("LRC : {} vers, dernier à {:.1} s", lines.len(), lines.last().map_or(0.0, |l| l.0));
     let text: Vec<align::TextLine> = lines.iter().map(|(t, s)| align::TextLine { start: Some(*t), text: s.clone() }).collect();
+
+    // Structure chantée : pour chaque groupe de mots entendus par Whisper, vers LRC qui
+    // lui ressemble le plus (numéros seulement, jamais le texte).
+    if std::env::args().any(|a| a == "--structure") {
+        let verses: Vec<Vec<String>> = text
+            .iter()
+            .filter(|t| !t.text.trim().is_empty())
+            .map(|t| t.text.split_whitespace().map(align::normalize).collect())
+            .collect();
+        let mut groups: Vec<Vec<&lyrics::Word>> = vec![];
+        for w in &rec {
+            match groups.last_mut() {
+                Some(g) if w.start - g.last().unwrap().end < 0.8 && g.len() < 8 => g.push(w),
+                _ => groups.push(vec![w]),
+            }
+        }
+        println!("début  mots  vers (score)  2e");
+        for g in groups.iter().filter(|g| g.len() >= 2) {
+            let ws: Vec<String> = g.iter().map(|w| align::normalize(&w.text)).collect();
+            let mut scores: Vec<(usize, f64)> = verses
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, ws.iter().filter(|w| v.contains(w)).count() as f64 / ws.len() as f64))
+                .collect();
+            scores.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let ties: Vec<String> = scores.iter().take_while(|s| s.1 == scores[0].1).map(|s| s.0.to_string()).collect();
+            println!("{:>6.1} {:>4}  {:>10} ({:.2})  {}", g[0].start, g.len(), ties.join(","), scores[0].1, scores.get(ties.len()).map_or(String::new(), |s| format!("{} ({:.2})", s.0, s.1)));
+        }
+        return Ok(());
+    }
     let _ = align::align(&text, &rec, duration);
     let st = align::last_stats();
     println!(
@@ -180,25 +221,41 @@ fn main() -> anyhow::Result<()> {
         println!("émissions : {} trames ({:.1} s de calcul ou de lecture)", em.frames, t0.elapsed().as_secs_f64());
         let t1 = std::time::Instant::now();
         // Guide : méthode de secours (comme pipeline::build_lyrics), sauf avec --libre.
-        let ons = karaoke::vocal::load_or_compute(&dir, &output);
-        let guide = align::align_with(&text, &rec, duration, &ons);
+        let guide = karaoke::forced::guide_windows(&text, &rec);
         let free = std::env::args().any(|a| a == "--libre");
-        let lines = karaoke::forced::align_lines(&text, &em, (!free).then_some(&guide[..])).expect("alignement forcé");
-        println!("alignement forcé : {} lignes en {:.2} s", lines.len(), t1.elapsed().as_secs_f64());
+        let lines = karaoke::forced::align_verses(&text, &em, guide.as_deref().filter(|_| !free), skip_setting())
+            .expect("alignement forcé");
+        println!(
+            "alignement forcé : {} vers, {} sautés, en {:.2} s",
+            lines.len(),
+            lines.iter().filter(|l| l.is_none()).count(),
+            t1.elapsed().as_secs_f64()
+        );
+        let text_ne: Vec<&align::TextLine> = text.iter().filter(|t| !t.text.trim().is_empty()).collect();
         if std::env::args().any(|a| a == "--lignes") {
             // Par vers : heure LRC, début MMS, début méthode de secours, durée MMS, nombre de mots.
             let onsets = karaoke::vocal::load_or_compute(&dir, &output);
             let fb = align::align_with(&text, &rec, duration, &onsets);
+            let heard = |i: usize| {
+                guide.as_ref().and_then(|g| g.get(i)).map_or(String::new(), |w| {
+                    format!("{} [{:.0}–{:.0}]", if w.heard { "entendu" } else if w.sung { "sûr" } else { "·" }, w.lo, w.hi.min(9999.0))
+                })
+            };
             println!("vers  LRC     MMS     secours  MMS-LRC  durée  mots");
-            for (i, ((t, f), b)) in text.iter().zip(&lines).zip(&fb).enumerate() {
+            for (i, ((t, f), b)) in text_ne.iter().zip(&lines).zip(&fb).enumerate() {
+                let Some(f) = f else {
+                    println!("{i:>3} {:>7.2}       —  {:>7.2}         (sauté)        {:>4} {}", t.start.unwrap_or(f64::NAN), b.start(), b.words.len(), heard(i));
+                    continue;
+                };
                 println!(
-                    "{i:>3} {:>7.2} {:>7.2} {:>7.2} {:>+8.2} {:>6.2} {:>4}",
+                    "{i:>3} {:>7.2} {:>7.2} {:>7.2} {:>+8.2} {:>6.2} {:>4} {}",
                     t.start.unwrap_or(f64::NAN),
                     f.start(),
                     b.start(),
                     f.start() - t.start.unwrap_or(f64::NAN),
                     f.words.last().map_or(0.0, |w| w.end) - f.start(),
-                    f.words.len()
+                    f.words.len(),
+                    heard(i)
                 );
             }
         }
@@ -206,6 +263,7 @@ fn main() -> anyhow::Result<()> {
         let base = align::align(&text, &rec, duration);
         let mut diffs = Vec::new();
         for (bl, fl) in base.iter().zip(&lines) {
+            let Some(fl) = fl else { continue };
             for (bw, fw) in bl.words.iter().zip(&fl.words) {
                 if rec.iter().any(|r| (r.start - bw.start).abs() < 1e-9) {
                     diffs.push(fw.start - bw.start);
@@ -233,6 +291,7 @@ fn main() -> anyhow::Result<()> {
         let (mut dw, mut dm, mut sw, mut sm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut per_chunk: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
         for (bl, fl) in base.iter().zip(&lines) {
+            let Some(fl) = fl else { continue };
             for (bw, fw) in bl.words.iter().zip(&fl.words) {
                 if rec.iter().any(|r| (r.start - bw.start).abs() < 1e-9) {
                     if let Some(d) = near(bw.start) { dw.push(d.abs()); sw.push(-d); }
