@@ -1,4 +1,4 @@
-﻿//! Enchaînement complet : source → suppression de la voix → fichier karaoké.
+//! Enchaînement complet : source → suppression de la voix → fichier karaoké.
 //!
 //!   0. setup    : téléchargement automatique des outils et du modèle si besoin
 //!   1. yt-dlp   : téléchargement de la vidéo (ou de l'audio seul)
@@ -285,77 +285,18 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
     // 5. Paroles finales : texte exact (saisi ou trouvé en ligne) calé sur la reconnaissance.
     if need_lyrics {
         emit(Event::Stage("Synchronisation des paroles".into()));
-        let duration = media::duration(&output).unwrap_or(0.0);
-        let (language, recognized) = lyrics::read_whisper(&whisper_json, &o.language).unwrap_or_default();
-        let (text, origin) = if user_text {
-            (Some(lyrics::parse_text(&o.lyrics_text)), "paroles saisies".to_string())
-        } else if o.lyrics_online {
-            match lrclib::find(&title, meta.artist.as_deref(), meta.track.as_deref(), duration) {
-                Ok(Some(m)) => {
-                    let synced = matches!(m.lyrics, lrclib::Found::Synced(_));
-                    let lines = match m.lyrics {
-                        lrclib::Found::Synced(l) => {
-                            l.into_iter().map(|(t, s)| align::TextLine { start: Some(t), text: s }).collect()
-                        }
-                        lrclib::Found::Plain(l) => {
-                            l.into_iter().map(|s| align::TextLine { start: None, text: s }).collect()
-                        }
-                    };
-                    let kind = if synced { "synchronisées" } else { "non synchronisées" };
-                    (Some(lines), format!("LRCLIB, {kind} : {}", m.description))
-                }
-                Ok(None) => (None, "reconnaissance vocale (introuvables en ligne)".into()),
-                Err(e) => {
-                    emit(Event::Log(format!("Recherche en ligne impossible : {e:#}")));
-                    (None, "reconnaissance vocale".into())
-                }
-            }
-        } else {
-            (None, "reconnaissance vocale".into())
+        let req = LyricsRequest {
+            work_dir: &work_dir,
+            title: &title,
+            artist: meta.artist.as_deref(),
+            track: meta.track.as_deref(),
+            duration: media::duration(&output).unwrap_or(0.0),
+            language: &o.language,
+            user_text: user_text.then_some(o.lyrics_text.as_str()),
+            online: o.lyrics_online,
         };
-
-        // Origine courte, affichée dans le lecteur.
-        let short = if user_text {
-            "texte saisi"
-        } else if origin.starts_with("LRCLIB") {
-            "LRCLIB"
-        } else {
-            "reconnaissance vocale"
-        };
-        let text_synced = text.as_ref().is_some_and(|t| t.iter().any(|l| l.start.is_some()));
-        let result = match text {
-            // Texte exact : horodaté (LRC) ou calé sur la reconnaissance.
-            Some(t) if text_synced || !recognized.is_empty() => Some(Lyrics {
-                language: language.clone(),
-                lines: align::align(&t, &recognized, duration),
-                offset: 0.0,
-                source: short.into(),
-            }),
-            Some(_) => {
-                emit(Event::Warning(
-                    "Paroles trouvées sans minutage et reconnaissance vocale indisponible : impossible de les synchroniser."
-                        .into(),
-                ));
-                None
-            }
-            None if !recognized.is_empty() => Some(Lyrics {
-                language: language.clone(),
-                lines: lyrics::group_lines(recognized.clone()),
-                offset: 0.0,
-                source: "reconnaissance vocale".into(),
-            }),
-            None => None,
-        };
-        match result.filter(|l| !l.lines.is_empty()) {
-            Some(ly) => {
-                emit(Event::Log(format!(
-                    "Paroles : {} lignes, {} mots — source : {origin}",
-                    ly.lines.len(),
-                    ly.word_count()
-                )));
-                ly.save(&lyrics_path)?;
-            }
-            None => emit(Event::Warning("Aucune parole disponible pour ce morceau.".into())),
+        if let Some(ly) = build_lyrics(&req, emit) {
+            ly.save(&lyrics_path)?;
         }
     }
 
@@ -365,6 +306,89 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
         outcome.lyrics = None;
     }
     Ok(outcome)
+}
+
+/// Données nécessaires pour construire (ou reconstruire) les paroles synchronisées.
+pub struct LyricsRequest<'a> {
+    /// Dossier de la chanson (contient `whisper.json`).
+    pub work_dir: &'a Path,
+    pub title: &'a str,
+    pub artist: Option<&'a str>,
+    pub track: Option<&'a str>,
+    /// Durée du morceau (s).
+    pub duration: f64,
+    pub language: &'a str,
+    /// Texte exact fourni par l'utilisateur (prioritaire sur la recherche en ligne).
+    pub user_text: Option<&'a str>,
+    /// Chercher les paroles exactes dans LRCLIB.
+    pub online: bool,
+}
+
+/// Paroles finales : texte exact (saisi, sinon trouvé en ligne) aligné sur la voix
+/// reconnue par Whisper ; à défaut, la reconnaissance seule. Ne relance pas Whisper :
+/// utilise `whisper.json` s'il existe.
+pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Lyrics> {
+    let (language, recognized) =
+        lyrics::read_whisper(&r.work_dir.join(lyrics::WHISPER_JSON), r.language).unwrap_or_default();
+    let (text, origin, short) = if let Some(t) = r.user_text {
+        (Some(lyrics::parse_text(t)), "paroles saisies".to_string(), "texte saisi")
+    } else if r.online {
+        match lrclib::find(r.title, r.artist, r.track, r.duration) {
+            Ok(Some(m)) => {
+                let synced = matches!(m.lyrics, lrclib::Found::Synced(_));
+                let lines = match m.lyrics {
+                    lrclib::Found::Synced(l) => {
+                        l.into_iter().map(|(t, s)| align::TextLine { start: Some(t), text: s }).collect()
+                    }
+                    lrclib::Found::Plain(l) => l.into_iter().map(|s| align::TextLine { start: None, text: s }).collect(),
+                };
+                let kind = if synced { "synchronisées" } else { "non synchronisées" };
+                (Some(lines), format!("LRCLIB, {kind} : {}", m.description), "LRCLIB")
+            }
+            Ok(None) => (None, "reconnaissance vocale (introuvables en ligne)".into(), "reconnaissance vocale"),
+            Err(e) => {
+                emit(Event::Log(format!("Recherche en ligne impossible : {e:#}")));
+                (None, "reconnaissance vocale".into(), "reconnaissance vocale")
+            }
+        }
+    } else {
+        (None, "reconnaissance vocale".into(), "reconnaissance vocale")
+    };
+
+    let text_synced = text.as_ref().is_some_and(|t| t.iter().any(|l| l.start.is_some()));
+    let result = match text {
+        // Texte exact : horodaté (LRC) ou calé sur la reconnaissance.
+        Some(t) if text_synced || !recognized.is_empty() => Some(Lyrics {
+            language: language.clone(),
+            lines: align::align(&t, &recognized, r.duration),
+            offset: 0.0,
+            source: short.into(),
+        }),
+        Some(_) => {
+            emit(Event::Warning(
+                "Paroles trouvées sans minutage et reconnaissance vocale indisponible : impossible de les synchroniser."
+                    .into(),
+            ));
+            None
+        }
+        None if !recognized.is_empty() => Some(Lyrics {
+            language: language.clone(),
+            lines: lyrics::group_lines(recognized),
+            offset: 0.0,
+            source: "reconnaissance vocale".into(),
+        }),
+        None => None,
+    };
+    match result.filter(|l| !l.lines.is_empty()) {
+        Some(ly) => {
+            emit(Event::Log(format!("Paroles : {} lignes, {} mots — source : {origin}", ly.lines.len(), ly.word_count())));
+            Some(ly)
+        }
+        None => {
+            emit(Event::Warning("Aucune parole disponible pour ce morceau.".into()));
+            None
+        }
+    }
 }
 
 fn spectral(o: &Options, pcm: &[f32], emit: &mut dyn FnMut(Event)) -> Vec<f32> {

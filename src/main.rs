@@ -1,4 +1,4 @@
-﻿//! MagicMus — application graphique : télécharge une vidéo YouTube, transcrit les
+//! MagicMus — application graphique : télécharge une vidéo YouTube, transcrit les
 //! paroles, supprime la voix et lit le karaoké dans la fenêtre (tonalité et vitesse
 //! réglables). Design : maquette « MagicMus design modern » (Claude Design).
 
@@ -6,6 +6,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod theme;
+mod ui_library;
+
+use ui_library::{LibUi, Settings, Store, Tab};
 
 use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, Sense, Stroke,
@@ -66,29 +69,93 @@ fn step_of(stage: &str) -> Option<usize> {
     }
 }
 
+/// Enregistre les plantages dans `Documents\MagicMus\erreurs.log` (l'application n'a
+/// pas de console : sans cela, le message serait perdu).
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = karaoke::library::data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("[{}] {info}\n{bt}\n", karaoke::library::now());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("erreurs.log")) {
+            use std::io::Write;
+            let _ = f.write_all(msg.as_bytes());
+        }
+        default(info);
+    }));
+}
+
+/// Diagnostic (option « demo ») : enregistre l'adresse et la pile d'appels de toute
+/// violation d'accès dans `erreurs.log`.
+#[cfg(feature = "demo")]
+fn install_exception_log() {
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        unsafe {
+            let rec = &*(*info).ExceptionRecord;
+            if rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
+                let path = karaoke::library::data_dir().join("erreurs.log");
+                let head = format!(
+                    "violation d'accès à {:?} (opération {}, adresse {:#x})\n",
+                    rec.ExceptionAddress, rec.ExceptionInformation[0], rec.ExceptionInformation[1]
+                );
+                let _ = std::fs::write(&path, &head); // d'abord l'essentiel
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = std::fs::write(&path, format!("{head}{bt}\n"));
+            }
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+    unsafe {
+        AddVectoredExceptionHandler(1, Some(handler));
+    }
+}
+
+/// Trace de démarrage (option « demo ») dans `traces.log`.
+#[cfg(feature = "demo")]
+fn trace(step: &str) {
+    use std::io::Write;
+    let path = karaoke::library::data_dir().join("traces.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{step}");
+    }
+}
+#[cfg(not(feature = "demo"))]
+fn trace(_: &str) {}
+
 fn main() -> eframe::Result {
+    #[cfg(feature = "demo")]
+    install_exception_log();
+    trace("main");
+    install_crash_log();
     tools::setup_path();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("MagicMus")
         .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([1040.0, 680.0]);
+        .with_min_inner_size([1200.0, 700.0]);
     if let Some(icon) = th::window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     // Un fichier passé en argument (« Ouvrir avec… ») est ouvert directement.
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
+    trace("avant run_native");
     eframe::run_native(
         "MagicMus",
         options,
         Box::new(move |cc| {
+            trace("création de l'application");
             th::install(&cc.egui_ctx);
+            trace("polices et thème installés");
             let mut app = App::new(th::logo(&cc.egui_ctx));
+            trace("application créée");
             if let Some(path) = arg.filter(|p| p.is_file()) {
                 app.open_path(path);
             }
             #[cfg(feature = "demo")]
-            app.demo(std::env::var("MAGICMUS_DEMO").ok().as_deref());
+            app.demo(std::env::var("MAGICMUS_DEMO").ok().as_deref(), &cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )
@@ -141,17 +208,33 @@ struct App {
     export_rx: Option<Receiver<ExportMsg>>,
     export_task: Task,
     export_result: Option<Result<PathBuf, String>>,
+    /// Resynchronisation des paroles en cours, et son dernier résultat (message, réussite, instant).
+    resync_rx: Option<Receiver<(Option<karaoke::lyrics::Lyrics>, Vec<String>)>>,
+    resync_msg: Option<(String, bool, std::time::Instant)>,
+
+    // Bibliothèque, historique et réglages (Documents\MagicMus)
+    store: Store,
+    settings: Settings,
+    lib_ui: LibUi,
 }
 
 impl App {
     fn new(logo: TextureHandle) -> Self {
-        let out_dir = std::env::var_os("USERPROFILE")
-            .map(|h| PathBuf::from(h).join("Music").join("Karaoke"))
-            .unwrap_or_else(|| PathBuf::from("karaoke_out"));
-        Self {
+        // Bibliothèque, historique, réglages et chansons : Documents\MagicMus.
+        let (store, settings) = Store::open();
+        let out_dir = settings.out_dir.clone().unwrap_or_else(karaoke::library::songs_dir);
+        let opts = Options {
+            out_dir,
+            method: settings.method(),
+            language: settings.language.clone(),
+            lyrics: settings.lyrics,
+            lyrics_online: settings.lyrics_online,
+            ..Options::default()
+        };
+        let mut app = Self {
             logo,
-            opts: Options { out_dir, ..Options::default() },
-            auto_play: true,
+            opts,
+            auto_play: settings.auto_play,
             rx: None,
             task: Task::default(),
             log: Vec::new(),
@@ -164,14 +247,39 @@ impl App {
             has_video: false,
             show_lyrics: true,
             seek_drag: None,
-            highlight: 0,
-            lyrics_size: 36.0,
-            burn_lyrics: true,
+            highlight: settings.highlight.min(th::HIGHLIGHTS.len() - 1),
+            lyrics_size: settings.lyrics_size.clamp(24.0, 52.0),
+            burn_lyrics: settings.burn_lyrics,
             lyrics_editor: None,
             export_rx: None,
             export_task: Task::default(),
             export_result: None,
-        }
+            resync_rx: None,
+            resync_msg: None,
+            store,
+            settings: settings.clone(),
+            lib_ui: LibUi::default(),
+        };
+        app.detect_old_songs(&settings);
+        // Dossiers de la bibliothèque dépliés au démarrage.
+        app.lib_ui.open = app.store.library.folders.iter().map(|f| f.id).collect();
+        app
+    }
+
+    /// Recopie les réglages courants et les enregistre s'ils ont changé.
+    fn sync_settings(&mut self) {
+        let default_dir = karaoke::library::songs_dir();
+        let s = &mut self.settings;
+        s.highlight = self.highlight;
+        s.lyrics_size = self.lyrics_size;
+        s.quality = self.opts.method == Method::Ia;
+        s.language = self.opts.language.clone();
+        s.lyrics = self.opts.lyrics;
+        s.lyrics_online = self.opts.lyrics_online;
+        s.auto_play = self.auto_play;
+        s.burn_lyrics = self.burn_lyrics;
+        s.out_dir = (self.opts.out_dir != default_dir).then(|| self.opts.out_dir.clone());
+        self.store.save_settings(&self.settings);
     }
 
     fn running(&self) -> bool {
@@ -179,9 +287,9 @@ impl App {
     }
 
     /// Écrans de démonstration (option de compilation « demo » uniquement), pour vérifier le
-    /// rendu sans lancer de traitement : MAGICMUS_DEMO=traitement | correction.
+    /// rendu sans lancer de traitement : MAGICMUS_DEMO=traitement | correction | resynchro.
     #[cfg(feature = "demo")]
-    fn demo(&mut self, which: Option<&str>) {
+    fn demo(&mut self, which: Option<&str>, ctx: &egui::Context) {
         match which {
             Some("traitement") => {
                 let (tx, rx) = mpsc::channel();
@@ -192,6 +300,15 @@ impl App {
             }
             Some("correction") => {
                 self.lyrics_editor = Some("un deux trois quatre\ncinq six sept huit\nneuf dix onze douze".into());
+            }
+            Some("bibliotheque") => self.lib_ui.tab = Tab::Library,
+            Some("historique") => self.lib_ui.tab = Tab::History,
+            // Avec un karaoké passé en argument : resynchronise ses paroles au démarrage.
+            Some("resynchro") => {
+                if let Some(p) = &self.player {
+                    p.pause();
+                }
+                self.start_resync(ctx.clone());
             }
             _ => {}
         }
@@ -272,6 +389,9 @@ impl App {
                     // Les paroles saisies ont été enregistrées avec ce morceau.
                     self.opts.lyrics_text.clear();
                     self.paste_open = false;
+                    let now = karaoke::library::now();
+                    self.store.history.record_created(&out.output, &out.title, self.opts.input.trim(), now);
+                    self.store.save_history();
                     self.load(out)
                 }
                 Err(e) => {
@@ -299,6 +419,8 @@ impl App {
         self.export_result = None;
         match Player::open(&out.output, &out.title, out.has_video, out.lyrics, out.source.as_deref()) {
             Ok(p) => {
+                self.store.history.record_played(&out.output, &out.title, karaoke::library::now());
+                self.store.save_history();
                 if self.auto_play {
                     p.play();
                 }
@@ -356,6 +478,75 @@ impl App {
         });
     }
 
+    // ──────────────────────────── Resynchronisation ────────────────────────────
+
+    /// Reconstruit les paroles du morceau ouvert (sans relancer Whisper) : paroles
+    /// exactes en ligne, ou texte saisi / corrigé, recalées sur la voix entendue.
+    fn start_resync(&mut self, ctx: egui::Context) {
+        let Some(p) = &self.player else { return };
+        let Some(dir) = p.path.parent().map(PathBuf::from) else { return };
+        let old = p.lyrics.clone();
+        // Un texte fourni ou corrigé par l'utilisateur est conservé.
+        let user_text = old
+            .as_ref()
+            .filter(|l| l.source == "texte saisi" || l.source == "texte corrigé")
+            .map(|l| l.to_text());
+        let language = old.as_ref().map(|l| l.language.clone()).filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".into());
+        let (title, duration) = (p.title.clone(), p.duration());
+        let (tx, rx) = mpsc::channel();
+        self.resync_rx = Some(rx);
+        self.resync_msg = None;
+        std::thread::spawn(move || {
+            let mut warnings = Vec::new();
+            let req = pipeline::LyricsRequest {
+                work_dir: &dir,
+                title: &title,
+                artist: None,
+                track: None,
+                duration,
+                language: &language,
+                user_text: user_text.as_deref(),
+                online: true,
+            };
+            let mut ly = pipeline::build_lyrics(&req, &mut |e| {
+                if let Event::Warning(w) = e {
+                    warnings.push(w);
+                }
+            });
+            if let (Some(ly), Some(src)) = (&mut ly, user_text.as_ref().and(Some("texte corrigé"))) {
+                ly.source = src.into();
+            }
+            if let Some(ly) = &ly {
+                let _ = ly.save(&dir.join(pipeline::LYRICS_FILE));
+            }
+            let _ = tx.send((ly, warnings));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_resync(&mut self) {
+        let Some(rx) = &self.resync_rx else { return };
+        let msg = match rx.try_recv() {
+            Ok((Some(ly), _)) => {
+                let n = ly.lines.len();
+                if let Some(p) = &mut self.player {
+                    p.lyrics = Some(ly);
+                }
+                self.show_lyrics = true;
+                (format!("Paroles resynchronisées ({n} lignes)"), true)
+            }
+            Ok((None, warnings)) => (warnings.into_iter().next().unwrap_or_else(|| "Aucune parole trouvée".into()), false),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => ("La resynchronisation a échoué".into(), false),
+        };
+        self.resync_rx = None;
+        if !msg.1 {
+            // Échec : bandeau d'avertissement en haut de l'écran.
+            self.warnings.push(format!("Resynchronisation impossible : {}", msg.0));
+        }
+        self.resync_msg = Some((msg.0, msg.1, std::time::Instant::now()));
+    }
+
     fn poll_export(&mut self) {
         let Some(rx) = &self.export_rx else { return };
         loop {
@@ -396,7 +587,27 @@ impl App {
                         ui.label(th::t("Le karaoké qui fait disparaître la voix", 13.0, W::Medium, th::MUTED));
                     });
                 });
+                ui.add_space(14.0);
+                ui_library::tabs(ui, &mut self.lib_ui.tab);
             });
+
+        let tab = self.lib_ui.tab;
+        if tab != Tab::Create {
+            egui::CentralPanel::default()
+                .frame(Frame::new().inner_margin(Margin { left: 18, right: 14, top: 0, bottom: 8 }))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_width(ui.available_width() - 6.0);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        if tab == Tab::Library {
+                            self.library_panel(ui);
+                        } else {
+                            self.history_panel(ui);
+                        }
+                    });
+                });
+            return;
+        }
 
         // Bouton de création, toujours visible en bas
         egui::Panel::bottom("creer")
@@ -754,7 +965,7 @@ impl App {
         }
         let mut reveal = false;
         ui.horizontal(|ui| {
-            let right = 380.0;
+            let right = 580.0;
             ui.vertical(|ui| {
                 ui.set_width((ui.available_width() - right).max(200.0));
                 ui.spacing_mut().item_spacing.y = 6.0;
@@ -762,7 +973,8 @@ impl App {
                 ui.add(egui::Label::new(th::t(&p.title, 30.0, W::Serif, th::INK)).truncate());
             });
             ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                reveal = th::secondary(ui, "Afficher dans le dossier").clicked();
+                reveal = th::secondary(ui, "Dossier").on_hover_text("Afficher dans l'Explorateur").clicked();
+                ui_library::library_button(ui, &mut self.store, &mut self.lib_ui, &p.path, &p.title);
                 th::chip(ui, &origin, Some(th::PANEL));
             });
         });
@@ -888,8 +1100,9 @@ impl App {
 
         // Paroles et enregistrement
         let has_lyrics = p.lyrics.is_some();
-        let (mut open_editor, mut do_export) = (false, false);
+        let (mut open_editor, mut do_export, mut do_resync) = (false, false, false);
         let exporting = self.export_rx.is_some();
+        let resyncing = self.resync_rx.is_some();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             ui.scope(|ui| {
@@ -897,8 +1110,8 @@ impl App {
                     ui.multiply_opacity(0.45);
                 }
                 ui.spacing_mut().item_spacing.x = 10.0;
-                th::switch(ui, &mut self.show_lyrics);
-                ui.label(th::t("Paroles à l'écran", 13.0, W::Bold, th::INK));
+                th::switch(ui, &mut self.show_lyrics).on_hover_text("Afficher les paroles sur l'image");
+                ui.label(th::t("Paroles", 13.0, W::Bold, th::INK));
             });
             if let Some(ly) = &mut p.lyrics {
                 ui.label(th::t("Décalage", 13.0, W::Bold, th::MUTED))
@@ -914,7 +1127,25 @@ impl App {
                     }
                 }
             }
-            open_editor = th::secondary(ui, "Corriger les paroles…").clicked();
+            open_editor = th::secondary(ui, "Corriger…").on_hover_text("Corriger le texte des paroles").clicked();
+            if resyncing {
+                ui.spinner();
+                ui.label(th::t("Synchronisation…", 13.0, W::Bold, th::MUTED));
+            } else {
+                // Après une réussite, le bouton l'indique quelques secondes.
+                let done = self.resync_msg.as_ref().filter(|m| m.1 && m.2.elapsed().as_secs() < 6);
+                let label = if done.is_some() { "Resynchronisé" } else { "Resynchroniser" };
+                let hover = match done {
+                    Some(m) => m.0.clone(),
+                    None => "Recale les paroles sur la voix entendue (paroles exactes en ligne ou texte corrigé + \
+                             reconnaissance vocale). Remet le décalage à 0."
+                        .into(),
+                };
+                do_resync = th::secondary(ui, label).on_hover_text(hover).clicked();
+                if done.is_some() {
+                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                }
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
@@ -923,7 +1154,8 @@ impl App {
                         .on_hover_text("Enregistre le karaoké avec la tonalité et la vitesse actuelles")
                         .clicked();
                 if self.has_video {
-                    th::checkbox(ui, &mut self.burn_lyrics, "Incruster les paroles", has_lyrics);
+                    th::checkbox(ui, &mut self.burn_lyrics, "Incruster", has_lyrics)
+                        .on_hover_text("Incruster les paroles dans la vidéo enregistrée");
                 }
                 if exporting {
                     let frac = self.export_task.progress.unwrap_or(0.0);
@@ -951,6 +1183,9 @@ impl App {
         }
         if do_export {
             self.start_export(ctx.clone());
+        }
+        if do_resync {
+            self.start_resync(ctx.clone());
         }
         if self.player.as_ref().is_some_and(|p| p.is_playing()) {
             ctx.request_repaint();
@@ -1067,8 +1302,10 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        trace("image");
         self.poll();
         self.poll_export();
+        self.poll_resync();
         let ctx = ui.ctx().clone();
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.is_file()).collect());
@@ -1088,6 +1325,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(th::BG).inner_margin(Margin::same(28)))
             .show(ui, |ui| {
+                self.migration_banner(ui);
                 self.banners(ui);
                 if self.running() {
                     self.processing(ui);
@@ -1100,6 +1338,7 @@ impl eframe::App for App {
 
         self.lyrics_editor_window(&ctx);
         self.shortcuts(&ctx);
+        self.sync_settings();
     }
 }
 

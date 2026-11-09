@@ -1,4 +1,4 @@
-//! Alignement des paroles exactes (base en ligne ou texte collé) sur les mots
+﻿//! Alignement des paroles exactes (base en ligne ou texte collé) sur les mots
 //! horodatés reconnus par Whisper.
 //!
 //! Les deux suites de mots sont alignées par programmation dynamique (Needleman-Wunsch)
@@ -8,6 +8,7 @@
 use crate::lyrics::{Line, Word};
 
 /// Paroles exactes en entrée : vers, avec éventuellement l'heure de début (LRC).
+#[derive(Clone, Debug)]
 pub struct TextLine {
     pub start: Option<f64>,
     pub text: String,
@@ -16,6 +17,20 @@ pub struct TextLine {
 /// Construit les lignes horodatées mot à mot.
 /// `recognized` : mots reconnus (peut être vide) ; `end_of_song` : durée du morceau.
 pub fn align(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Line> {
+    // Les heures LRC sont d'abord recalées sur la voix réellement entendue.
+    let recalibrated;
+    let text = if !recognized.is_empty() && text.iter().any(|l| l.start.is_some()) {
+        recalibrated = recalibrate(text, recognized);
+        &recalibrated[..]
+    } else {
+        text
+    };
+    let mut lines = align_inner(text, recognized, end_of_song);
+    enforce_order(&mut lines);
+    lines
+}
+
+fn align_inner(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Line> {
     // Vers non vides ; un vers vide horodaté marque la fin du précédent (pause).
     struct V {
         start: Option<f64>,
@@ -75,26 +90,122 @@ pub fn align(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Li
         let lo = v.start.unwrap_or(prev_end).max(prev_end);
         let hi = v.limit.unwrap_or(next_start).min(next_start).max(lo + 0.3);
 
-        let words = fill(&v.words, &known, lo, hi, v.start.is_some());
+        let words = fill(&v.words, &known, lo, hi, prev_end, v.start.is_some());
         prev_end = words.last().map_or(prev_end, |w| w.end);
         lines.push(Line { words });
     }
     lines
 }
 
+/// Recale les heures des vers (LRC) sur la voix entendue.
+///
+/// Les paroles en ligne correspondent souvent à une autre version du morceau (album
+/// plutôt que clip) : décalage global, parfois variable. On aligne d'abord le texte
+/// seul (sans contrainte de temps), on mesure pour chaque vers l'écart entre l'heure
+/// entendue de son premier mot apparié et l'heure LRC, puis on lisse ces écarts.
+fn recalibrate(text: &[TextLine], rec: &[Word]) -> Vec<TextLine> {
+    let mut flat: Vec<(usize, String, Option<(f64, f64)>)> = Vec::new();
+    let mut pos_in_line = Vec::new();
+    for (li, l) in text.iter().enumerate() {
+        for (k, w) in l.text.split_whitespace().enumerate() {
+            flat.push((li, w.to_string(), None));
+            pos_in_line.push(k);
+        }
+    }
+    let rec_norm: Vec<String> = rec.iter().map(|w| normalize(&w.text)).collect();
+    let pairs = needleman_wunsch(&flat, rec, &rec_norm);
+
+    // Écart brut par vers, d'après son premier mot apparié.
+    let mut raw: Vec<(usize, f64)> = Vec::new();
+    for (i, j) in pairs {
+        let li = flat[i].0;
+        if raw.last().is_some_and(|r| r.0 == li) {
+            continue;
+        }
+        if let Some(s) = text[li].start {
+            let d = rec[j].start - s - pos_in_line[i] as f64 * 0.3;
+            if d.abs() < 20.0 {
+                raw.push((li, d));
+            }
+        }
+    }
+    if raw.is_empty() {
+        return text.to_vec();
+    }
+    let global = median(raw.iter().map(|r| r.1).collect());
+    // Les écarts aberrants (mot répété ailleurs dans la chanson) sont écartés.
+    let good: Vec<(usize, f64)> = raw.into_iter().filter(|(_, d)| (d - global).abs() <= 3.0).collect();
+
+    text.iter()
+        .enumerate()
+        .map(|(li, l)| {
+            // Écart local : médiane des 5 vers mesurés les plus proches.
+            let mut near: Vec<(usize, f64)> = good.iter().map(|&(gi, d)| (gi.abs_diff(li), d)).collect();
+            near.sort_by_key(|x| x.0);
+            let off = if near.is_empty() { global } else { median(near.iter().take(5).map(|x| x.1).collect()) };
+            TextLine { start: l.start.map(|s| (s + off).max(0.0)), text: l.text.clone() }
+        })
+        .collect()
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Garantit que les mots se suivent : chaque mot commence après le précédent et se
+/// termine au plus tard au début du suivant (sinon plusieurs mots « s'allument » en
+/// même temps).
+fn enforce_order(lines: &mut [Line]) {
+    const MIN: f64 = 0.08;
+    let mut words: Vec<&mut Word> = lines.iter_mut().flat_map(|l| l.words.iter_mut()).collect();
+    for k in 1..words.len() {
+        let prev = words[k - 1].start;
+        if words[k].start < prev + MIN {
+            words[k].start = prev + MIN;
+        }
+    }
+    for k in 0..words.len() {
+        let next = words.get(k + 1).map(|w| w.start);
+        let w = &mut words[k];
+        let mut end = w.end.max(w.start + MIN);
+        if let Some(n) = next {
+            end = end.min(n);
+        }
+        w.end = end;
+    }
+}
+
 /// Complète les horodatages manquants d'un vers dans [lo, hi].
 /// `anchored_start` : le début du vers est fiable (LRC).
-fn fill(words: &[String], known: &[Option<(f64, f64)>], lo: f64, hi: f64, anchored_start: bool) -> Vec<Word> {
+/// `floor` : fin du vers précédent (aucun mot ne peut commencer avant).
+fn fill(
+    words: &[String],
+    known: &[Option<(f64, f64)>],
+    lo: f64,
+    hi: f64,
+    floor: f64,
+    anchored_start: bool,
+) -> Vec<Word> {
     let n = words.len();
     let weight: Vec<f64> = words.iter().map(|w| (w.chars().filter(|c| c.is_alphanumeric()).count() as f64).max(1.0)).collect();
     let est = |a: usize, b: usize| -> f64 { weight[a..b].iter().map(|w| (w * 0.075).clamp(0.22, 0.9)).sum() };
 
     // Corrige les horodatages connus incohérents (hors du vers ou non croissants).
     let mut t: Vec<Option<(f64, f64)>> = known.to_vec();
-    let mut last = lo - 0.01;
+    // Un mot entendu peut précéder l'heure estimée du vers (jusqu'à la largeur de la
+    // fenêtre d'alignement), mais jamais la fin du vers précédent.
+    let mut last = floor - 0.01;
     for x in t.iter_mut() {
         if let Some((s, e)) = *x {
-            if s < last - 0.05 || s > hi + 0.5 || (anchored_start && s < lo - 1.0) {
+            if s < last - 0.05 || s > hi + 0.5 || (anchored_start && s < lo - 1.6) {
                 *x = None;
             } else {
                 last = e.max(s);
@@ -120,8 +231,10 @@ fn fill(words: &[String], known: &[Option<(f64, f64)>], lo: f64, hi: f64, anchor
         while j < n && t[j].is_none() {
             j += 1;
         }
-        let left = if i == 0 { lo } else { out[i - 1].1 };
         let right = if j < n { t[j].unwrap().0 } else { hi };
+        // Le mot précédent peut finir après le début du suivant (fin de mot reconnue
+        // trop longue) : on repart alors juste après son début.
+        let left = if i == 0 { lo } else { out[i - 1].1.min(right).max(out[i - 1].0 + 0.08) };
         let gap = (right - left).max(0.05);
         let need = est(i, j);
         // Début de vers sans repère : les mots mènent au mot suivant (alignés à droite) ;
@@ -296,6 +409,39 @@ mod tests {
             for p in l.words.windows(2) {
                 assert!(p[0].start < p[1].start);
             }
+        }
+    }
+
+    #[test]
+    fn lrc_en_retard_recale_sur_la_voix() {
+        // Les heures LRC sont 1,2 à 2 s en retard sur la voix entendue (autre version du
+        // morceau) : les mots doivent suivre la voix, pas le LRC.
+        let rec = [
+            w("un", 3.8), w("deux", 4.3), w("trois", 4.8),
+            w("quatre", 7.9), w("cinq", 8.4),
+            w("six", 11.0), w("sept", 11.5), w("huit", 12.0),
+        ];
+        let text = [
+            line(Some(5.0), "un deux trois"),
+            line(Some(9.6), "quatre cinq"),
+            line(Some(12.2), "six sept huit"),
+        ];
+        let lines = align(&text, &rec, 60.0);
+        let starts: Vec<f64> = lines.iter().flat_map(|l| l.words.iter().map(|w| w.start)).collect();
+        assert_eq!(starts, [3.8, 4.3, 4.8, 7.9, 8.4, 11.0, 11.5, 12.0]);
+    }
+
+    #[test]
+    fn mots_dans_l_ordre_sans_chevauchement() {
+        // Fins de mots reconnues trop longues et un mot reconnu en avance.
+        let mut rec = vec![w("un", 1.0), w("deux", 1.4), w("quatre", 2.0)];
+        rec[0].end = 3.0;
+        rec[1].end = 2.6;
+        let lines = align(&[line(None, "un deux trois quatre cinq")], &rec, 30.0);
+        let ws = &lines[0].words;
+        for p in ws.windows(2) {
+            assert!(p[0].start < p[1].start, "ordre : {:?}", ws.iter().map(|w| w.start).collect::<Vec<_>>());
+            assert!(p[0].end <= p[1].start + 1e-9, "chevauchement");
         }
     }
 

@@ -24,6 +24,13 @@ Vérifier le rendu des écrans sans lancer de traitement (option de compilation 
 ```bash
 CARGO_TARGET_DIR=target/demo cargo build --release --features demo --bin karaoke
 MAGICMUS_DEMO=traitement target/demo/release/karaoke.exe   # ou MAGICMUS_DEMO=correction
+MAGICMUS_DEMO=resynchro target/demo/release/karaoke.exe <karaoke_ia.mp4>   # bouton « Resynchroniser »
+```
+
+Diagnostic de synchronisation d'une chanson (minutages et compteurs seulement, jamais le texte) :
+
+```bash
+cargo run --release --example diag_paroles -- "<dossier de la chanson>" [--resume]
 ```
 
 Le build de débogage (`cargo build` sans `--release`) plante au démarrage (erreur de segmentation, cause non
@@ -35,6 +42,8 @@ identifiée, aussi sans le mode démo) : tester avec `--release`.
 |---|---|
 | `src/main.rs` | GUI egui/eframe 0.37 (`App::ui`, `Panel::left`, `CentralPanel::show(ui, …)`) : écrans accueil, traitement, lecteur, modale de correction |
 | `src/theme.rs` | design MagicMus (maquette Claude Design) : couleurs, polices Nunito / DM Serif Display, composants dessinés à la main |
+| `src/ui_library.rs` | onglets Créer / Bibliothèque / Historique, réglages (`reglages.json`), déplacement depuis `Musique\Karaoke` |
+| `src/library.rs` | bibliothèque (dossiers imbriqués), historique, emplacement `Documents\MagicMus` (`MAGICMUS_DATA` pour le changer) |
 | `src/bin/karaoke-cli.rs` | ligne de commande (clap) |
 | `src/pipeline.rs` | enchaînement : outils → téléchargement → décodage → séparation → Whisper → encodage → paroles |
 | `src/setup.rs` | téléchargement automatique (yt-dlp, ffmpeg, Deno, ONNX Runtime, modèles) dans `%LOCALAPPDATA%\Karaoke` |
@@ -57,12 +66,22 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
 - ONNX Runtime en `load-dynamic` : la version statique pour Windows inclut DirectML et exige `DXCORE.lib`, absent du
   SDK Windows 10.0.18362 installé.
 - Paroles : texte saisi > LRCLIB > reconnaissance Whisper seule ; le minutage mot à mot vient de Whisper.
+  Construction dans `pipeline::build_lyrics` (utilisée par le traitement et par le bouton « Resynchroniser »,
+  qui ne relance pas Whisper : il relit `whisper.json`).
+- Les heures LRCLIB viennent souvent d'une autre version du morceau : `align::recalibrate` mesure l'écart
+  (voix entendue − LRC) vers par vers et le lisse avant l'alignement ; `enforce_order` interdit mots désordonnés
+  et chevauchements (sinon plusieurs mots « s'allument » en même temps).
 - L'horloge du lecteur est la position audio ; vidéo et paroles la suivent (`Player::position` compense la latence).
 - Les tests utilisent des paroles factices (« un deux trois… ») : ne jamais versionner ni afficher de vraies paroles.
 - Polices Nunito (fontsource) : leurs noms de famille internes sont inhabituels (« Nunito ExtraLight ExtraBold ») ;
   les sous-titres exportés citent ce nom exact (`lyrics::ASS_FONT`), sinon libass retombe sur Arial.
 - Captures d'écran de test : utiliser `PrintWindow` sur la fenêtre de l'app, pas une capture de l'écran (qui peut
   montrer ce que l'utilisateur fait par-dessus).
+- **Ne pas utiliser la caisse `dirs`** : avec elle, l'exe graphique plantait avant `main` (violation d'accès dans un
+  module inconnu) ; les dossiers Documents / Musique sont lus dans le registre (`library::user_folder`).
+- Données utilisateur dans `Documents\MagicMus` ; outils et modèles dans `%LOCALAPPDATA%\Karaoke` (volumineux).
+- Diagnostic de plantage : `erreurs.log` (panics) ; avec l'option `demo`, un gestionnaire d'exceptions Windows y
+  ajoute les violations d'accès, et `traces.log` liste les étapes du démarrage.
 
 ## État (2026-11-09)
 

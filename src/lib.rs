@@ -6,6 +6,7 @@ pub mod download;
 pub mod lrclib;
 pub mod dsp;
 pub mod export;
+pub mod library;
 pub mod lyrics;
 pub mod player;
 pub mod mdx;

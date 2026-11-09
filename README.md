@@ -6,7 +6,31 @@ paroles synchronisées, supprime la voix et lit la version instrumentale.
 ## Utilisation
 
 Double-cliquez sur **`dist\MagicMus.exe`**. Collez l'adresse YouTube (ou choisissez un fichier), puis cliquez sur
-**Créer le karaoké**. Les fichiers sont enregistrés dans `Musique\Karaoke`.
+**Créer le karaoké**.
+
+## Bibliothèque, historique et données
+
+Tout est enregistré dans **`Documents\MagicMus`** :
+
+| Élément | Contenu |
+|---|---|
+| `Chansons\` | un dossier par chanson (vidéo d'origine, karaoké, paroles) |
+| `bibliotheque.json` | dossiers et chansons de la bibliothèque |
+| `historique.json` | chansons créées et écoutées |
+| `reglages.json` | méthode, langue, couleur et taille des paroles… |
+| `erreurs.log` | détails d'un éventuel plantage |
+
+- **Historique** (onglet du panneau gauche) : chansons regroupées par jour ; clic pour rouvrir, étoile pour ajouter à
+  la bibliothèque, clic droit pour plus d'options.
+- **Bibliothèque** : dossiers et sous-dossiers ; glisser une chanson (ou un dossier) sur un dossier pour la ranger,
+  clic droit pour renommer, déplacer, supprimer un dossier (les chansons sont conservées) ; recherche par titre.
+  Le bouton « Ajouter à la bibliothèque » de l'en-tête du lecteur range la chanson ouverte.
+- Les karaokés de l'ancien emplacement (`Musique\Karaoke`) sont détectés au démarrage : un bandeau propose de les
+  déplacer dans `Documents\MagicMus\Chansons`.
+- La variable d'environnement `MAGICMUS_DATA` permet d'utiliser un autre dossier (version portable).
+
+Les outils et modèles d'IA (≈ 1 Go) restent dans `%LOCALAPPDATA%\Karaoke` : ils font partie de l'application, et
+Documents est souvent synchronisé avec OneDrive.
 
 ## Design
 
@@ -46,8 +70,9 @@ Le karaoké se lit dans la fenêtre :
 
   Le minutage mot à mot vient de la voix isolée, transcrite par Whisper (whisper.cpp, modèle large-v3-turbo,
   ≈ 550 Mo au premier usage) : les mots exacts sont alignés sur les mots entendus (`src/align.rs`).
-- **Corriger les paroles** : bouton « ✏ Corriger les paroles… » dans le lecteur ; le texte corrigé est recalé
-  automatiquement. Le réglage **Décalage** avance ou retarde l'ensemble des paroles.
+- **Corriger les paroles** : bouton « Corriger… » dans le lecteur ; le texte corrigé est recalé automatiquement.
+  Le réglage **Décalage** avance ou retarde l'ensemble des paroles. **Resynchroniser** recale en une seconde les
+  paroles d'un morceau déjà créé sur la voix entendue (sans relancer la reconnaissance vocale).
 - **Tonalité** (−12 à +12 demi-tons) et **vitesse** (50 à 150 %) se règlent pendant la lecture, sans que l'une modifie
   l'autre (Signalsmith Stretch, intégré dans `vendor/signalsmith`).
 - **Enregistrer…** : crée un fichier avec la tonalité et la vitesse actuelles, et les paroles karaoké incrustées dans la
@@ -87,6 +112,8 @@ On obtient `target/release/karaoke.exe` (interface graphique) et `target/release
 |---|---|
 | `src/main.rs` | interface graphique (egui) : accueil, traitement, lecteur, correction des paroles |
 | `src/theme.rs` | couleurs, polices, logo et composants du design MagicMus |
+| `src/ui_library.rs` | onglets Bibliothèque et Historique, réglages enregistrés |
+| `src/library.rs` | données de la bibliothèque et de l'historique (`Documents\MagicMus`) |
 | `src/player.rs` | lecteur intégré : son (cpal), image (ffmpeg), paroles |
 | `src/lyrics.rs` | transcription Whisper, lignes, sous-titres ASS karaoké |
 | `src/lrclib.rs` | recherche des paroles officielles (LRCLIB) |

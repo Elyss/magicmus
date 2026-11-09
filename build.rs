@@ -14,6 +14,13 @@ fn main() {
         .flag_if_supported("/EHsc")
         .compile("signalsmith-stretch");
 
+    // Pile du fil principal : 16 Mo au lieu de 1 Mo par défaut sous Windows. L'interface
+    // (egui, arborescence récursive de la bibliothèque) dépasse sinon 1 Mo, surtout en
+    // build de débogage, et le programme s'arrête net (débordement de pile).
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rustc-link-arg-bins=/STACK:16777216");
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/magicmus.ico")
