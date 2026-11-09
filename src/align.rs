@@ -469,7 +469,7 @@ pub fn normalize(w: &str) -> String {
 }
 
 /// Similarité de 0 à 1 (distance de Levenshtein normalisée).
-fn similarity(a: &str, b: &str) -> f32 {
+pub fn similarity(a: &str, b: &str) -> f32 {
     if a.is_empty() || b.is_empty() {
         return if a == b { 1.0 } else { 0.0 };
     }

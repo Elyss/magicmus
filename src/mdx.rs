@@ -35,13 +35,7 @@ pub fn separate(
     progress: &mut dyn FnMut(f32),
 ) -> Result<Vec<f32>> {
     let p = INST_HQ_3;
-    let env = ort::init_from(runtime)
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("chargement de {}", runtime.display()))?
-        .with_name("karaoke")
-        .build()
-        .map_err(|e| anyhow!("{e}"))
-        .context("initialisation d'ONNX Runtime")?;
+    let env = crate::setup::onnx_env(runtime)?;
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut builder = ort::session::Session::builder(&env)
         .map_err(|e| anyhow!("{e}"))?

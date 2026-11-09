@@ -15,6 +15,7 @@ pub mod media;
 pub mod pipeline;
 pub mod setup;
 pub mod stretch;
+pub mod sung;
 pub mod tools;
 pub mod update;
 pub mod vocal;

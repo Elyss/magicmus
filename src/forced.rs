@@ -61,12 +61,7 @@ pub const EMISSIONS_FILE: &str = "emissions.bin";
 
 /// Calcule les émissions du modèle sur la voix (`mono16k` : 16 kHz mono).
 pub fn emissions(runtime: &Path, model: &Path, mono16k: &[f32], progress: &mut dyn FnMut(f32)) -> Result<Emissions> {
-    let env = ort::init_from(runtime)
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("chargement de {}", runtime.display()))?
-        .with_name("magicmus-alignement")
-        .build()
-        .map_err(|e| anyhow!("{e}"))?;
+    let env = crate::setup::onnx_env(runtime)?;
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut builder = ort::session::Session::builder(&env)
         .map_err(|e| anyhow!("{e}"))?

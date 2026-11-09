@@ -338,7 +338,8 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
     let (text, origin, short) = if let Some(t) = r.user_text {
         (Some(lyrics::parse_text(t)), "paroles saisies".to_string(), "texte saisi")
     } else if r.online {
-        match lrclib::find(r.title, r.artist, r.track, r.duration) {
+        let heard: Vec<String> = recognized.iter().map(|w| w.text.clone()).collect();
+        match lrclib::find(r.title, r.artist, r.track, r.duration, &heard) {
             Ok(Some(m)) => {
                 let synced = matches!(m.lyrics, lrclib::Found::Synced(_));
                 let lines = match m.lyrics {
@@ -386,12 +387,26 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
     let onsets = r.karaoke.map(|k| crate::vocal::load_or_compute(r.work_dir, k)).unwrap_or_default();
     let fallback = (text_synced || !recognized.is_empty()).then(|| align::align_with(&t, &recognized, r.duration, &onsets));
 
-    // Méthode principale : alignement forcé de chaque mot sur la voix (MMS), chaque vers
-    // étant cherché près des mots que Whisper y a entendus (fenêtres du guide).
+    // Méthode principale : alignement forcé de chaque mot sur la voix (MMS), paroles dans
+    // leur ordre, chaque vers cherché près des mots que Whisper y a entendus (guide).
     let guide = crate::forced::guide_windows(&t, &recognized);
     let forced = r.karaoke.and_then(|k| forced_align(r.work_dir, k, &t, guide.as_deref(), emit));
     let result = match (forced, fallback) {
-        (Some(f), _) if agrees(&f, guide.as_deref()) => Some(lyrics_of(f.into_iter().flatten().collect())),
+        (Some(f), _) if agrees(&f, guide.as_deref()) => {
+            let shown: Vec<lyrics::Line> = f.into_iter().flatten().collect();
+            // Réparation par la transcription : refrains chantés en plus, ajouts de
+            // l'interprète (passages entendus où aucune parole n'est affichée).
+            let repaired = r.karaoke.and_then(|k| {
+                let rp = crate::sung::repair(&shown, &t, &recognized)?;
+                let lines = forced_align(r.work_dir, k, &rp.text, Some(&rp.windows), emit)?;
+                emit(Event::Log(format!(
+                    "Paroles réparées d'après la transcription : {} vers répétés, {} ajouts entendus",
+                    rp.repeats, rp.extras
+                )));
+                Some(lines.into_iter().flatten().collect::<Vec<_>>())
+            });
+            Some(lyrics_of(repaired.unwrap_or(shown)))
+        }
         (Some(_), Some(fb)) => {
             emit(Event::Log("Alignement forcé trop éloigné du minutage des paroles : méthode de secours".into()));
             Some(lyrics_of(fb))

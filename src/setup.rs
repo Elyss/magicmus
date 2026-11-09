@@ -164,6 +164,28 @@ fn check_microsoft_signature(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Environnement ONNX Runtime du processus. `ort` n'en autorise qu'un par processus : en
+/// recréer un (séparation de la voix puis alignement des paroles) échoue, même après la
+/// libération du premier. Il est donc créé une fois puis partagé.
+pub fn onnx_env(runtime: &Path) -> Result<ort::environment::Environment> {
+    use std::sync::{Mutex, OnceLock};
+    static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    let _guard = INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = ENV.get() {
+        return Ok(env.clone());
+    }
+    let env = ort::init_from(runtime)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("chargement de {}", runtime.display()))?
+        .with_name("magicmus")
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("initialisation d'ONNX Runtime")?;
+    let _ = ENV.set(env.clone());
+    Ok(env)
+}
+
 /// Chemin de `onnxruntime.dll` (à côté de l'exe, sinon téléchargé au premier usage).
 pub fn ensure_onnxruntime(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<PathBuf> {
     ensure_vc_runtime(progress)?;

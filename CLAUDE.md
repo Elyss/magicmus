@@ -81,9 +81,22 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
 
 - **Aucune installation pour l'utilisateur** : tout outil manquant est téléchargé au premier usage ; ne pas ajouter de
   dépendance système (Python, etc.).
+- **Un seul environnement ONNX Runtime par processus** (`ort` refuse d'en créer un second, même après la
+  libération du premier) : `setup::onnx_env`, partagé par la séparation (`mdx`) et l'alignement (`forced`).
+  Avant ce partage, l'alignement MMS échouait en silence après une séparation dans le même processus (création
+  dans l'application) et la méthode de secours prenait le relais ; les tests en processus séparé ne le voyaient
+  pas (`tests/onnx_env.rs`).
+- **Paroles officielles d'une reprise** (`lrclib::find`) : recherches « titre complet » puis « titre seul »
+  (« Artiste - Titre » → « Titre ») ; avec au moins 12 mots entendus, choix par ressemblance des paroles avec la
+  transcription (≥ 50 % des mots entendus présents), pas par durée (une reprise ou un live n'a pas la durée de
+  l'original). Sans transcription : ancien choix par durée (±8 s).
+- **Réparation par la transcription** (`src/sung.rs`) : après l'alignement des paroles officielles, les passages
+  entendus (≥ 3 mots) où rien n'est affiché sont ajoutés (vers officiel ressemblant = répétition, sinon texte
+  entendu = ajout), puis tout est réaligné. Un appariement global avec sauts/retours libres avait été essayé : sur
+  un refrain présent 24 fois (Watermelon Sugar), il choisissait des copies arbitraires et perdait des vers.
 - **CRT Visual C++ lié statiquement** (`.cargo/config.toml`, `+crt-static`, d'où Signalsmith en /MT) : l'exe démarre
   sans « Visual C++ Redistributable ». ONNX Runtime et whisper.cpp en ont besoin : `setup::ensure_vc_runtime`
-  (registre `VC\Runtimesd`, minimum 14.40, sinon ONNX Runtime 1.31 plante) télécharge `vc_redist.x64.exe`
+  (registre `VC\Runtimes\x64`, minimum 14.40, sinon ONNX Runtime 1.31 plante) télécharge `vc_redist.x64.exe`
   (aka.ms), vérifie la signature Microsoft et le lance via `Start-Process -Verb RunAs` (une demande UAC). Pas de
   DLL embarquées : celles des Build Tools 2019 installés ici sont en 14.27, trop anciennes. ffmpeg (MinGW), yt-dlp
   et Deno n'en ont pas besoin.
@@ -114,7 +127,8 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
     18 vers ; à 6 sans la règle « sûr », Complicated en perdait 3.
   Cas de référence : Complicated (5NPBIwQyPWE, LRC conforme), Feel Good Inc. (HyHNuVaZJ-k, LRC d'une autre
   version décalée de 17 à 40 s, Whisper muet 90 s), reprise de Something Just Like This (E5b3oBGjYK0, 2:25,
-  deux blocs du texte officiel coupés → 14 vers sautés sur 58). Garde-fou `pipeline::agrees` : méthode de secours
+  deux blocs du texte officiel coupés → 14 vers sautés sur 58), Sigrid – Watermelon Sugar live (FHTMHJevAMg :
+  reprise d'un autre artiste, Whisper n'entend que 80 mots). Garde-fou `pipeline::agrees` : méthode de secours
   (Whisper + `align.rs`) si plus des deux tiers des vers sont sautés.
 - Exactitude vérifiée sur parole de synthèse (System.Speech, heure exacte de chaque mot ; scripts
   `examples/tts/*.ps1`) : `cargo run --release --example diag_paroles -- --tts <wav 16 kHz> <json>` → écart médian

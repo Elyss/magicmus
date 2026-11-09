@@ -86,6 +86,9 @@ Le karaoké se lit dans la fenêtre :
   cherché près des mots que Whisper y a entendus ; entre deux vers entendus, les heures LRCLIB ne servent que si
   aucun passage n'a été coupé ou ajouté entre eux. Les vers que la version chantée ne contient pas (reprise
   raccourcie, couplet coupé) sont **sautés** et ne s'affichent pas.
+  Pour une reprise ou une version live, les paroles officielles sont retrouvées d'après ce qui est chanté (et non
+  d'après l'artiste ou la durée). Les passages bien entendus mais absents des paroles officielles (refrain répété
+  une fois de plus, phrase ajoutée par l'interprète) sont ajoutés.
   Méthode de secours (modèle indisponible, ou résultat trop éloigné du minutage LRCLIB) : transcription par Whisper
   (whisper.cpp, modèle large-v3-turbo, ≈ 550 Mo) et alignement des mots exacts sur les mots reconnus (`src/align.rs`).
 

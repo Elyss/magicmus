@@ -32,16 +32,19 @@ pub struct Match {
 const USER_AGENT: &str = "Karaoke/0.1 (application de bureau, https://github.com/)";
 
 /// Cherche les paroles d'un morceau. `title` : titre YouTube ou nom de fichier ;
-/// `artist` / `track` : métadonnées si connues ; `duration` : durée en secondes.
-pub fn find(title: &str, artist: Option<&str>, track: Option<&str>, duration: f64) -> Result<Option<Match>> {
-    let mut queries = Vec::new();
-    if let (Some(a), Some(t)) = (artist, track) {
-        queries.push(format!("{} {}", clean_title(t), a));
-    }
-    queries.push(clean_title(title));
-
+/// `artist` / `track` : métadonnées si connues ; `duration` : durée en secondes ;
+/// `heard` : mots entendus (Whisper), éventuellement vide.
+///
+/// Avec des mots entendus, le choix se fait sur la ressemblance des paroles avec ce qui
+/// est chanté, pas sur la durée : une reprise, une version live ou un clip n'ont pas la
+/// durée de l'enregistrement original. On cherche aussi le titre seul (« Artiste -
+/// Titre » → « Titre ») : l'interprète d'une reprise n'est pas celui des paroles.
+pub fn find(title: &str, artist: Option<&str>, track: Option<&str>, duration: f64, heard: &[String]) -> Result<Option<Match>> {
+    let queries = queries(title, artist, track);
     let agent = ureq::Agent::new_with_defaults();
-    for q in queries.iter().filter(|q| !q.trim().is_empty()) {
+    let heard = vocabulary(heard);
+    let mut pool: Vec<(Entry, String)> = Vec::new();
+    for q in &queries {
         let body = agent
             .get("https://lrclib.net/api/search")
             .query("q", q)
@@ -52,16 +55,83 @@ pub fn find(title: &str, artist: Option<&str>, track: Option<&str>, duration: f6
             .read_to_string()
             .context("réponse LRCLIB illisible")?;
         let entries: Vec<Entry> = serde_json::from_str(&body).context("réponse LRCLIB illisible")?;
-        if let Some(m) = best(entries, duration, q) {
-            return Ok(Some(m));
+        if heard.len() < MIN_HEARD {
+            // Sans transcription : première recherche qui donne un résultat plausible.
+            if let Some(m) = best_by_duration(entries, duration, q) {
+                return Ok(Some(m));
+            }
+        } else {
+            pool.extend(entries.into_iter().map(|e| (e, q.clone())));
         }
     }
-    Ok(None)
+    Ok(best_by_text(pool, &heard, duration))
 }
 
-/// Choisit la meilleure entrée : durée proche, paroles synchronisées de préférence,
-/// titre ressemblant à la recherche.
-fn best(entries: Vec<Entry>, duration: f64, query: &str) -> Option<Match> {
+/// Mots entendus nécessaires pour choisir les paroles d'après le texte.
+const MIN_HEARD: usize = 12;
+
+/// Recherches à essayer, de la plus précise à la plus large.
+fn queries(title: &str, artist: Option<&str>, track: Option<&str>) -> Vec<String> {
+    let mut q = Vec::new();
+    if let (Some(a), Some(t)) = (artist, track) {
+        q.push(format!("{} {}", clean_title(t), a));
+    }
+    if let Some(t) = track {
+        q.push(clean_title(t));
+    }
+    q.push(clean_title(title));
+    // « Artiste - Titre (…) » : le titre seul (une reprise n'est pas de cet artiste).
+    let main = title.split(['|', '｜']).next().unwrap_or(title);
+    for sep in [" - ", " – ", " — "] {
+        if let Some((_, right)) = main.split_once(sep) {
+            q.push(clean_title(right));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    q.into_iter().filter(|s| !s.trim().is_empty() && seen.insert(s.to_lowercase())).collect()
+}
+
+/// Mots significatifs (minuscules, 3 lettres et plus), sans doublon.
+fn vocabulary<S: AsRef<str>>(words_in: &[S]) -> std::collections::HashSet<String> {
+    words_in.iter().flat_map(|w| words(w.as_ref())).filter(|w| w.chars().count() >= 3).collect()
+}
+
+/// Choix d'après le texte : part des mots entendus présents dans les paroles (et
+/// réciproquement), paroles synchronisées de préférence, durée en dernier recours.
+fn best_by_text(pool: Vec<(Entry, String)>, heard: &std::collections::HashSet<String>, duration: f64) -> Option<Match> {
+    let mut best: Option<(f64, Entry)> = None;
+    for (e, _) in pool {
+        if e.instrumental {
+            continue;
+        }
+        let Some(text) = e.plain_lyrics.clone().or_else(|| e.synced_lyrics.as_deref().map(strip_lrc)) else { continue };
+        let vocab = vocabulary(&text.split_whitespace().collect::<Vec<_>>());
+        if vocab.is_empty() {
+            continue;
+        }
+        let covered = heard.iter().filter(|w| vocab.contains(*w)).count() as f64 / heard.len() as f64;
+        let sung = vocab.iter().filter(|w| heard.contains(*w)).count() as f64 / vocab.len() as f64;
+        // Moins de la moitié des mots entendus dans ces paroles : autre chanson.
+        if covered < 0.5 {
+            continue;
+        }
+        let dt = e.duration.map_or(60.0, |d| (d - duration).abs());
+        let score = covered * 10.0 + sung * 5.0 + if e.synced_lyrics.is_some() { 1.0 } else { 0.0 } - dt.min(60.0) / 60.0;
+        if best.as_ref().is_none_or(|b| score > b.0) {
+            best = Some((score, e));
+        }
+    }
+    best.map(|(_, e)| to_match(e))
+}
+
+/// Texte d'un LRC sans les horodatages.
+fn strip_lrc(lrc: &str) -> String {
+    parse_lrc(lrc).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n")
+}
+
+/// Choisit la meilleure entrée sans transcription : durée proche, paroles synchronisées
+/// de préférence, titre ressemblant à la recherche.
+fn best_by_duration(entries: Vec<Entry>, duration: f64, query: &str) -> Option<Match> {
     let q = words(query);
     let mut scored: Vec<(f64, Entry)> = entries
         .into_iter()
@@ -82,7 +152,10 @@ fn best(entries: Vec<Entry>, duration: f64, query: &str) -> Option<Match> {
         })
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let (_, e) = scored.into_iter().next()?;
+    scored.into_iter().next().map(|(_, e)| to_match(e))
+}
+
+fn to_match(e: Entry) -> Match {
     let description = format!(
         "{} — {}",
         e.artist_name.as_deref().unwrap_or("?"),
@@ -100,7 +173,7 @@ fn best(entries: Vec<Entry>, duration: f64, query: &str) -> Option<Match> {
                 .collect(),
         ),
     };
-    Some(Match { description, lyrics })
+    Match { description, lyrics }
 }
 
 /// Lit un texte LRC (« [mm:ss.xx] texte »).
@@ -171,6 +244,14 @@ mod tests {
         );
         assert_eq!(clean_title("Artiste - Titre [Official Video]"), "Artiste Titre");
         assert_eq!(clean_title("Artiste - Titre ft. Autre"), "Artiste Titre");
+    }
+
+    #[test]
+    fn recherches_d_une_reprise() {
+        let q = queries("Sigrid - Watermelon Sugar (Live on NRK P3)", None, None);
+        assert_eq!(q, ["Sigrid Watermelon Sugar", "Watermelon Sugar"]);
+        let q = queries("Something Just Like This - The Chainsmokers & Coldplay | Romy Wave (piano cover)", None, None);
+        assert_eq!(q, ["Something Just Like This The Chainsmokers & Coldplay", "The Chainsmokers & Coldplay"]);
     }
 
     #[test]

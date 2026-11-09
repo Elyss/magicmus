@@ -107,12 +107,17 @@ fn main() -> anyhow::Result<()> {
         let mut ly = karaoke::pipeline::build_lyrics(&req, &mut |e| {
             match e {
                 karaoke::pipeline::Event::Warning(w) => println!("avertissement : {w}"),
-                karaoke::pipeline::Event::Log(w) if w.contains("secours") => println!("{w}"),
+                karaoke::pipeline::Event::Log(w) => println!("journal : {w}"),
+                karaoke::pipeline::Event::Stage(w) => println!("étape : {w}"),
                 _ => {}
             }
         })
         .expect("paroles");
         ly.offset = old.map_or(0.0, |l| l.offset);
+        if std::env::args().any(|a| a == "--essai") {
+            println!("essai : paroles.json non modifié ({} lignes, source « {} »)", ly.lines.len(), ly.source);
+            return Ok(());
+        }
         ly.save(&file)?;
         println!("paroles.json réécrit ({} lignes, source « {} ») en {:.1} s", ly.lines.len(), ly.source, t0.elapsed().as_secs_f64());
         return Ok(());
@@ -157,7 +162,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // LRC trouvé en ligne : écart entre l'heure du vers et l'heure entendue de son premier mot
-    let Some(m) = lrclib::find(&title, None, None, duration)? else {
+    let heard: Vec<String> = rec.iter().map(|w| w.text.clone()).collect();
+    let Some(m) = lrclib::find(&title, None, None, duration, &heard)? else {
         println!("aucune paroles en ligne");
         return Ok(());
     };
@@ -221,10 +227,24 @@ fn main() -> anyhow::Result<()> {
         println!("émissions : {} trames ({:.1} s de calcul ou de lecture)", em.frames, t0.elapsed().as_secs_f64());
         let t1 = std::time::Instant::now();
         // Guide : méthode de secours (comme pipeline::build_lyrics), sauf avec --libre.
-        let guide = karaoke::forced::guide_windows(&text, &rec);
         let free = std::env::args().any(|a| a == "--libre");
-        let lines = karaoke::forced::align_verses(&text, &em, guide.as_deref().filter(|_| !free), skip_setting())
+        let guide = karaoke::forced::guide_windows(&text, &rec).filter(|_| !free);
+        let mut sung_text: Vec<align::TextLine> = text.clone();
+        let mut origin: Vec<Option<usize>> = (0..text.iter().filter(|t| !t.text.trim().is_empty()).count()).map(Some).collect();
+        let mut lines = karaoke::forced::align_verses(&sung_text, &em, guide.as_deref(), skip_setting())
             .expect("alignement forcé");
+        let mut guide = guide;
+        // Réparation par la transcription (sauf --ancien), comme pipeline::build_lyrics.
+        if !std::env::args().any(|a| a == "--ancien") {
+            let shown: Vec<karaoke::lyrics::Line> = lines.iter().flatten().cloned().collect();
+            if let Some(rp) = karaoke::sung::repair(&shown, &text, &rec) {
+                println!("réparation : {} vers répétés, {} ajouts entendus", rp.repeats, rp.extras);
+                lines = karaoke::forced::align_verses(&rp.text, &em, Some(&rp.windows), skip_setting()).expect("réalignement");
+                origin = vec![None; rp.text.len()];
+                sung_text = rp.text;
+                guide = Some(rp.windows);
+            }
+        }
         println!(
             "alignement forcé : {} vers, {} sautés, en {:.2} s",
             lines.len(),
@@ -241,73 +261,76 @@ fn main() -> anyhow::Result<()> {
                     format!("{} [{:.0}–{:.0}]", if w.heard { "entendu" } else if w.sung { "sûr" } else { "·" }, w.lo, w.hi.min(9999.0))
                 })
             };
-            println!("vers  LRC     MMS     secours  MMS-LRC  durée  mots");
-            for (i, ((t, f), b)) in text_ne.iter().zip(&lines).zip(&fb).enumerate() {
+            println!("vers  orig  LRC     MMS     secours  MMS-LRC  durée  mots");
+            for (i, f) in lines.iter().enumerate() {
+                let (o, lrc, sec) = match origin[i] {
+                    Some(o) => (o.to_string(), text_ne[o].start.unwrap_or(f64::NAN), fb.get(o).map_or(f64::NAN, |b| b.start())),
+                    None => ("ajout".to_string(), f64::NAN, f64::NAN),
+                };
                 let Some(f) = f else {
-                    println!("{i:>3} {:>7.2}       —  {:>7.2}         (sauté)        {:>4} {}", t.start.unwrap_or(f64::NAN), b.start(), b.words.len(), heard(i));
+                    println!("{i:>3} {o:>5} {lrc:>7.2}       —  {sec:>7.2}         (sauté)        {:>4} {}", sung_text[i].text.split_whitespace().count(), heard(i));
                     continue;
                 };
                 println!(
-                    "{i:>3} {:>7.2} {:>7.2} {:>7.2} {:>+8.2} {:>6.2} {:>4} {}",
-                    t.start.unwrap_or(f64::NAN),
+                    "{i:>3} {o:>5} {lrc:>7.2} {:>7.2} {sec:>7.2} {:>+8.2} {:>6.2} {:>4} {}",
                     f.start(),
-                    b.start(),
-                    f.start() - t.start.unwrap_or(f64::NAN),
+                    f.start() - lrc,
                     f.words.last().map_or(0.0, |w| w.end) - f.start(),
                     f.words.len(),
                     heard(i)
                 );
             }
         }
-        // Référence : mots dont l'heure vient directement de Whisper (méthode actuelle).
-        let base = align::align(&text, &rec, duration);
+        // Mots entendus par Whisper retrouvés dans les paroles affichées (même mot à
+        // ±1 s) : mesure du décrochage, indépendante de la structure du texte.
+        let shown: Vec<&karaoke::lyrics::Word> = lines.iter().flatten().flat_map(|l| l.words.iter()).collect();
         let mut diffs = Vec::new();
-        for (bl, fl) in base.iter().zip(&lines) {
-            let Some(fl) = fl else { continue };
-            for (bw, fw) in bl.words.iter().zip(&fl.words) {
-                if rec.iter().any(|r| (r.start - bw.start).abs() < 1e-9) {
-                    diffs.push(fw.start - bw.start);
-                }
+        let mut counted = 0;
+        for r in rec.iter().filter(|r| align::normalize(&r.text).chars().count() >= 2) {
+            counted += 1;
+            let n = align::normalize(&r.text);
+            if let Some(d) = shown
+                .iter()
+                .filter(|w| align::normalize(&w.text) == n)
+                .map(|w| w.start - r.start)
+                .filter(|d| d.abs() <= 1.0)
+                .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+            {
+                diffs.push(d);
             }
         }
         let mut abs: Vec<f64> = diffs.iter().map(|d| d.abs()).collect();
         abs.sort_by(f64::total_cmp);
-        let mut signed = diffs.clone();
-        signed.sort_by(f64::total_cmp);
         let within = |x: f64| abs.iter().filter(|e| **e <= x).count() as f64 * 100.0 / abs.len().max(1) as f64;
         println!(
-            "écart MMS − Whisper sur {} mots reconnus : médian {:.2} s (signé {:+.2} s) · ≤ 0,2 s : {:.0} % · ≤ 0,5 s : {:.0} % · > 1 s : {:.0} %",
-            abs.len(),
-            abs[abs.len() / 2],
-            signed[signed.len() / 2],
-            within(0.2),
-            within(0.5),
-            100.0 - within(1.0)
+            "mots entendus retrouvés à ±1 s dans les paroles affichées : {}/{} ({:.0} %) · écart médian {:.2} s · ≤ 0,3 s : {:.0} %",
+            diffs.len(),
+            counted,
+            diffs.len() as f64 * 100.0 / counted.max(1) as f64,
+            abs.get(abs.len() / 2).copied().unwrap_or(f64::NAN),
+            within(0.3)
         );
-
-        // Arbitre : attaque de la voix la plus proche (à ±0,5 s) de chaque mot reconnu.
-        let onsets = karaoke::vocal::load_or_compute(&dir, &output);
-        let near = |t: f64| onsets.iter().map(|o| o - t).filter(|d| d.abs() <= 0.5).min_by(|a, b| a.abs().total_cmp(&b.abs()));
-        let (mut dw, mut dm, mut sw, mut sm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut per_chunk: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
-        for (bl, fl) in base.iter().zip(&lines) {
-            let Some(fl) = fl else { continue };
-            for (bw, fw) in bl.words.iter().zip(&fl.words) {
-                if rec.iter().any(|r| (r.start - bw.start).abs() < 1e-9) {
-                    if let Some(d) = near(bw.start) { dw.push(d.abs()); sw.push(-d); }
-                    if let Some(d) = near(fw.start) { dm.push(d.abs()); sm.push(-d); }
-                    per_chunk.entry((bw.start / 15.0) as usize).or_default().push(fw.start - bw.start);
-                }
+        // Mots entendus non retrouvés : affichés plus loin (décalage) ou jamais à ±5 s (texte).
+        let (mut late, mut absent, mut late_t) = (0, 0, Vec::new());
+        for r in rec.iter().filter(|r| align::normalize(&r.text).chars().count() >= 2) {
+            let n = align::normalize(&r.text);
+            let best = shown.iter().filter(|w| align::normalize(&w.text) == n).map(|w| w.start - r.start)
+                .min_by(|a, b| a.abs().total_cmp(&b.abs()));
+            match best {
+                Some(d) if d.abs() <= 1.0 => {}
+                Some(d) if d.abs() <= 5.0 => { late += 1; late_t.push(format!("{:.0}s:{:+.1}", r.start, d)); }
+                _ => absent += 1,
             }
         }
-        let med = |v: &mut Vec<f64>| { v.sort_by(f64::total_cmp); v.get(v.len() / 2).copied().unwrap_or(f64::NAN) };
-        println!(
-            "distance à l'attaque de voix la plus proche : Whisper médiane {:.3} s ({} mots) · MMS médiane {:.3} s ({} mots)",
-            med(&mut dw), dw.len(), med(&mut dm), dm.len()
-        );
-        println!("mot − attaque la plus proche (signé) : Whisper médiane {:+.3} s · MMS médiane {:+.3} s", med(&mut sw), med(&mut sm));
-        let chunks: Vec<String> = per_chunk.iter_mut().map(|(k, v)| format!("{}:{:+.2}", k, med(v))).collect();
-        println!("écart signé MMS − Whisper par fenêtre de 15 s : {}", chunks.join("  "));
+        println!("non retrouvés : {late} affichés entre 1 et 5 s d'écart [{}] · {absent} absents à ±5 s", late_t.join(" "));
+        // Arbitre : début des mots affichés − attaque de la voix la plus proche (±0,5 s).
+        let onsets = karaoke::vocal::load_or_compute(&dir, &output);
+        let mut sm: Vec<f64> = shown
+            .iter()
+            .filter_map(|w| onsets.iter().map(|o| w.start - o).filter(|d| d.abs() <= 0.5).min_by(|a, b| a.abs().total_cmp(&b.abs())))
+            .collect();
+        sm.sort_by(f64::total_cmp);
+        println!("mot affiché − attaque la plus proche : médiane {:+.3} s ({} mots sur {})", sm.get(sm.len() / 2).copied().unwrap_or(f64::NAN), sm.len(), shown.len());
         return Ok(());
     }
 
@@ -340,7 +363,7 @@ fn main() -> anyhow::Result<()> {
         let drop: std::collections::HashSet<usize> = masked.iter().map(|t| t.3).collect();
         let rec_masked: Vec<_> = rec.iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, w)| w.clone()).collect();
         println!("scénario « {} » — mots de référence : {}, masqués : {}", if scenario.is_empty() { "suites" } else { &scenario }, truth.len(), masked.len());
-        let mut eval = |name: &str, legacy: bool, ons: &[f64]| {
+        let eval = |name: &str, legacy: bool, ons: &[f64]| {
             align::set_legacy_placement(legacy);
             let lines = align::align_with(&text, &rec_masked, duration, ons);
             align::set_legacy_placement(false);
