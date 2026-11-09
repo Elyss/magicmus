@@ -1,0 +1,9 @@
+# Compilation (régénérée par `cargo build`)
+/target/
+
+# Exécutables livrés (à publier plutôt via les Releases GitHub)
+/dist/
+*.old.exe
+
+# Fichiers produits par la version ligne de commande
+/karaoke_out/
