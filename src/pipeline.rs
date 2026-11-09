@@ -314,12 +314,23 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
             (None, "reconnaissance vocale".into())
         };
 
+        // Origine courte, affichée dans le lecteur.
+        let short = if user_text {
+            "texte saisi"
+        } else if origin.starts_with("LRCLIB") {
+            "LRCLIB"
+        } else {
+            "reconnaissance vocale"
+        };
         let text_synced = text.as_ref().is_some_and(|t| t.iter().any(|l| l.start.is_some()));
         let result = match text {
             // Texte exact : horodaté (LRC) ou calé sur la reconnaissance.
-            Some(t) if text_synced || !recognized.is_empty() => {
-                Some(Lyrics { language: language.clone(), lines: align::align(&t, &recognized, duration), offset: 0.0 })
-            }
+            Some(t) if text_synced || !recognized.is_empty() => Some(Lyrics {
+                language: language.clone(),
+                lines: align::align(&t, &recognized, duration),
+                offset: 0.0,
+                source: short.into(),
+            }),
             Some(_) => {
                 emit(Event::Warning(
                     "Paroles trouvées sans minutage et reconnaissance vocale indisponible : impossible de les synchroniser."
@@ -327,9 +338,12 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
                 ));
                 None
             }
-            None if !recognized.is_empty() => {
-                Some(Lyrics { language: language.clone(), lines: lyrics::group_lines(recognized.clone()), offset: 0.0 })
-            }
+            None if !recognized.is_empty() => Some(Lyrics {
+                language: language.clone(),
+                lines: lyrics::group_lines(recognized.clone()),
+                offset: 0.0,
+                source: "reconnaissance vocale".into(),
+            }),
             None => None,
         };
         match result.filter(|l| !l.lines.is_empty()) {

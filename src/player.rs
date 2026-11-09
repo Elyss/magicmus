@@ -449,24 +449,36 @@ fn display_size(w: u32, h: u32) -> (u32, u32) {
     (even(w as f64 * scale), even(h as f64 * scale))
 }
 
-pub const HIGHLIGHT: Color32 = Color32::from_rgb(0xff, 0xd7, 0x00);
+/// Apparence des paroles à l'écran.
+pub struct LyricsStyle {
+    /// Taille de la ligne en cours (px) ; la suivante fait 68 % de cette taille.
+    pub size: f32,
+    /// Couleur des mots chantés.
+    pub highlight: Color32,
+    /// Police de la ligne en cours et de la ligne suivante.
+    pub current: egui::FontFamily,
+    pub next: egui::FontFamily,
+}
 
 /// Dessine les paroles karaoké en bas de `rect` : ligne en cours (mots chantés
-/// colorés progressivement) et ligne suivante.
-pub fn draw_lyrics(painter: &egui::Painter, rect: Rect, lyrics: &Lyrics, t: f64) {
+/// colorés progressivement) et ligne suivante, atténuée.
+pub fn draw_lyrics(painter: &egui::Painter, rect: Rect, lyrics: &Lyrics, t: f64, style: &LyricsStyle) {
     let t = t + lyrics.offset;
     let Some(idx) = lyrics.line_at(t) else { return };
-    let size = (rect.height() * 0.065).clamp(14.0, 48.0);
+    let next_size = style.size * 0.68;
+    let y_next = rect.bottom() - 34.0 - next_size * 0.6;
+    let y_cur = y_next - next_size * 0.6 - 10.0 - style.size * 0.6;
     let line = &lyrics.lines[idx];
-    let y = rect.bottom() - rect.height() * 0.16;
-    draw_line(painter, rect, line, t, size, y, true);
+    let started = line.start() <= t + 0.05;
+    draw_line(painter, rect, line, t, style.size, y_cur, started, style, &style.current);
     if let Some(next) = lyrics.lines.get(idx + 1) {
         if next.start() - t < 8.0 {
-            draw_line(painter, rect, next, f64::NEG_INFINITY, size * 0.75, y + size * 1.25, false);
+            draw_line(painter, rect, next, f64::NEG_INFINITY, next_size, y_next, false, style, &style.next);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
     painter: &egui::Painter,
     rect: Rect,
@@ -475,11 +487,14 @@ fn draw_line(
     mut size: f32,
     y: f32,
     current: bool,
+    style: &LyricsStyle,
+    family: &egui::FontFamily,
 ) {
-    let base = if current { Color32::WHITE } else { Color32::from_gray(190) };
+    // Ligne en cours en blanc, ligne suivante (t = −∞) en blanc à 60 %.
+    let base = if t.is_finite() { Color32::WHITE } else { Color32::from_white_alpha(153) };
     // Mise en page mot par mot, réduite si la ligne est trop large.
     let layout = |size: f32| {
-        let font = FontId::proportional(size);
+        let font = FontId::new(size, family.clone());
         let space = painter.layout_no_wrap(" ".into(), font.clone(), base).size().x;
         let words: Vec<_> = line
             .words
@@ -497,16 +512,16 @@ fn draw_line(
     }
 
     let mut x = rect.center().x - width / 2.0;
-    let outline = (size / 16.0).max(1.5);
+    let edge = (size / 30.0).max(1.0);
     for (w, galley) in line.words.iter().zip(&words) {
         let pos = Pos2::new(x, y - galley.size().y / 2.0);
         let wr = Rect::from_min_size(pos, galley.size());
-        // contour noir pour la lisibilité sur l'image
-        for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (1.0, 1.0), (-1.0, -1.0)] {
+        // ombre douce portée vers le bas + léger contour, pour la lisibilité sur l'image
+        for (dx, dy, a) in [(0.0, 3.0, 70u8), (0.0, 2.0, 90), (-1.0, 0.0, 110), (1.0, 0.0, 110), (0.0, -1.0, 90), (0.0, 1.0, 110)] {
             painter.galley_with_override_text_color(
-                pos + egui::vec2(dx * outline, dy * outline),
+                pos + egui::vec2(dx * edge, dy * edge),
                 galley.clone(),
-                Color32::from_black_alpha(220),
+                Color32::from_black_alpha(a),
             );
         }
         painter.galley(pos, galley.clone(), base);
@@ -517,7 +532,7 @@ fn draw_line(
                 painter.with_clip_rect(clip.intersect(painter.clip_rect())).galley_with_override_text_color(
                     pos,
                     galley.clone(),
-                    HIGHLIGHT,
+                    style.highlight,
                 );
             }
         }

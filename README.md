@@ -1,11 +1,19 @@
-# Karaoké
+# MagicMus
 
-Application Windows (Rust) qui télécharge une vidéo YouTube, supprime la voix et lit la version instrumentale.
+Le karaoké qui fait disparaître la voix : application Windows (Rust) qui télécharge une vidéo YouTube, affiche les
+paroles synchronisées, supprime la voix et lit la version instrumentale.
 
 ## Utilisation
 
-Double-cliquez sur **`dist\Karaoke.exe`**. Collez l'adresse YouTube (ou choisissez un fichier), puis cliquez sur
-**Supprimer la voix**. Les fichiers sont enregistrés dans `Musique\Karaoke`.
+Double-cliquez sur **`dist\MagicMus.exe`**. Collez l'adresse YouTube (ou choisissez un fichier), puis cliquez sur
+**Créer le karaoké**. Les fichiers sont enregistrés dans `Musique\Karaoke`.
+
+## Design
+
+Interface d'après la maquette « MagicMus design modern » (Claude Design) : tons crème et rose, boutons noir prune,
+titres en DM Serif Display, texte en Nunito (polices OFL, `assets/fonts`), logo `assets/magicmus-logo.png`.
+Couleurs et composants dessinés à la main dans `src/theme.rs`. Dans les options : couleur des mots chantés (rose, or,
+crème, lavande) et taille des paroles.
 
 **Aucune installation n'est nécessaire.** Au premier usage, l'application télécharge elle-même ce dont elle a besoin
 dans `%LOCALAPPDATA%\Karaoke` (environ 300 Mo, une seule fois) :
@@ -77,7 +85,8 @@ On obtient `target/release/karaoke.exe` (interface graphique) et `target/release
 
 | Fichier | Rôle |
 |---|---|
-| `src/main.rs` | interface graphique (egui) |
+| `src/main.rs` | interface graphique (egui) : accueil, traitement, lecteur, correction des paroles |
+| `src/theme.rs` | couleurs, polices, logo et composants du design MagicMus |
 | `src/player.rs` | lecteur intégré : son (cpal), image (ffmpeg), paroles |
 | `src/lyrics.rs` | transcription Whisper, lignes, sous-titres ASS karaoké |
 | `src/lrclib.rs` | recherche des paroles officielles (LRCLIB) |

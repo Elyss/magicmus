@@ -14,7 +14,7 @@ fn fake_lyrics() -> Lyrics {
             Word { text: names[i % 8].to_string(), start, end: start + 0.45 }
         })
         .collect();
-    Lyrics { language: "fr".into(), lines: group_lines(words), offset: 0.0 }
+    Lyrics { language: "fr".into(), lines: group_lines(words), offset: 0.0, source: String::new() }
 }
 
 #[test]
@@ -24,7 +24,7 @@ fn export_tonalite_vitesse_paroles() {
     let dest = src.with_file_name("export_test.mp4");
     let ly = fake_lyrics();
     ly.save(&src.with_file_name("paroles.json")).unwrap();
-    let s = ExportSettings { tempo: 1.2, semitones: 2.0, burn_lyrics: true };
+    let s = ExportSettings { tempo: 1.2, semitones: 2.0, burn_lyrics: true, highlight: [0xf7, 0xa6, 0xc9] };
     export(&src, true, Some(&ly), &s, &dest, &mut |stage, p| eprintln!("{stage} {p:?}")).unwrap();
     assert!(dest.is_file());
 }

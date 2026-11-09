@@ -43,11 +43,17 @@ pub struct Lyrics {
     /// Avance d'affichage réglée par l'utilisateur (s) : positif = paroles plus tôt.
     #[serde(default)]
     pub offset: f64,
+    /// Origine du texte (« LRCLIB », « texte saisi », « reconnaissance vocale »).
+    #[serde(default)]
+    pub source: String,
 }
 
 impl Lyrics {
     pub fn load(path: &Path) -> Result<Self> {
-        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        let bytes = std::fs::read(path)?;
+        // Tolère une marque BOM (fichier modifié dans un éditeur Windows).
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+        Ok(serde_json::from_slice(bytes)?)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -209,8 +215,15 @@ pub fn group_lines(words: Vec<Word>) -> Vec<Line> {
 
 /// Sous-titres karaoké au format ASS (balises `\kf` : remplissage progressif des mots).
 /// `tempo` : vitesse de lecture appliquée (les temps sont divisés d'autant).
-pub fn to_ass(lyrics: &Lyrics, tempo: f64, width: u32, height: u32) -> String {
+/// Nom de famille interne de `assets/fonts/Nunito-ExtraBold.ttf` (fourni à libass
+/// lors de l'export) : c'est ce nom qu'il faut citer pour que libass trouve la police.
+pub const ASS_FONT: &str = "Nunito ExtraLight ExtraBold";
+
+/// `highlight` : couleur des mots chantés (RVB).
+pub fn to_ass(lyrics: &Lyrics, tempo: f64, width: u32, height: u32, highlight: [u8; 3]) -> String {
     let lyrics = &lyrics.shifted();
+    // Couleurs ASS : &HAABBGGRR
+    let primary = format!("&H00{:02X}{:02X}{:02X}", highlight[2], highlight[1], highlight[0]);
     let font_size = (height as f64 * 0.075).round();
     let margin_v = (height as f64 * 0.07).round();
     let mut s = String::new();
@@ -219,7 +232,7 @@ pub fn to_ass(lyrics: &Lyrics, tempo: f64, width: u32, height: u32) -> String {
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n\
          [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
          Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Karaoke,Arial,{font_size},&H0000D7FF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},2,2,40,40,{margin_v},1\n\n\
+         Style: Karaoke,{ASS_FONT},{font_size},{primary},&H00FFFFFF,&H00241C25,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},2,2,40,40,{margin_v},1\n\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
         outline = (font_size / 14.0).max(2.0).round(),
     );
@@ -296,9 +309,10 @@ mod tests {
         let ly = Lyrics {
             language: "fr".into(),
             lines: vec![Line { words: vec![w("un", 1.0, 1.5), w("deux", 2.0, 2.5)] }],
-            offset: 0.0,
+            offset: 0.0, source: String::new(),
         };
-        let ass = to_ass(&ly, 2.0, 1920, 1080);
+        let ass = to_ass(&ly, 2.0, 1920, 1080, [0xf7, 0xa6, 0xc9]);
+        assert!(ass.contains(&format!(",{ASS_FONT},81,&H00C9A6F7,")), "{ass}");
         // Vitesse ×2 : la ligne apparaît à (1.0 − 0.8) / 2 = 0,10 s.
         assert!(ass.contains("Dialogue: 0,0:00:00.10,"), "{ass}");
         assert!(ass.contains("{\\k40}{\\kf25}un {\\k25}{\\kf25}deux"), "{ass}");
@@ -313,7 +327,7 @@ mod tests {
                 Line { words: vec![w("a", 10.0, 11.0)] },
                 Line { words: vec![w("b", 20.0, 21.0)] },
             ],
-            offset: 0.0,
+            offset: 0.0, source: String::new(),
         };
         assert_eq!(ly.line_at(0.0), None);
         assert_eq!(ly.line_at(8.0), Some(0));

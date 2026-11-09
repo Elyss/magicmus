@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 eframe = "0.37.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
 rfd = "0.18.0"
 rustfft = "6.4.1"
@@ -18,3 +19,8 @@ zip = "9.5.0"
 
 [build-dependencies]
 cc = "1.11.1"
+winresource = "0.1.34"
+
+[features]
+# Écrans de démonstration pour vérifier le rendu (MAGICMUS_DEMO=traitement | correction).
+demo = []

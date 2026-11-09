@@ -11,7 +11,15 @@ pub struct ExportSettings {
     pub semitones: f32,
     /// Incruster les paroles dans l'image (vidéo seulement).
     pub burn_lyrics: bool,
+    /// Couleur des mots chantés (RVB).
+    pub highlight: [u8; 3],
 }
+
+/// Polices des paroles incrustées (Nunito, licence OFL), fournies à libass.
+const LYRICS_FONTS: [(&str, &[u8]); 2] = [
+    ("Nunito-ExtraBold.ttf", include_bytes!("../assets/fonts/Nunito-ExtraBold.ttf")),
+    ("Nunito-Bold.ttf", include_bytes!("../assets/fonts/Nunito-Bold.ttf")),
+];
 
 /// `source` : fichier karaoké (sans voix) ; `dest` : fichier à créer.
 pub fn export(
@@ -52,17 +60,18 @@ pub fn export(
         }
         if let (true, Some(ly)) = (s.burn_lyrics, lyrics) {
             let (w, h) = media::video_size(&source).unwrap_or((1920, 1080));
-            std::fs::write(tmp.join("paroles.ass"), lyrics::to_ass(ly, s.tempo as f64, w, h))?;
-            let fonts = Path::new(r"C:\Windows\Fonts");
-            let mut filter = "ass=paroles.ass".to_string();
-            if fonts.join("arial.ttf").is_file() {
-                std::fs::create_dir_all(tmp.join("fonts"))?;
-                for f in ["arial.ttf", "arialbd.ttf"] {
-                    let _ = std::fs::copy(fonts.join(f), tmp.join("fonts").join(f));
-                }
-                filter.push_str(":fontsdir=fonts");
+            std::fs::write(tmp.join("paroles.ass"), lyrics::to_ass(ly, s.tempo as f64, w, h, s.highlight))?;
+            let fonts_dir = tmp.join("fonts");
+            std::fs::create_dir_all(&fonts_dir)?;
+            for (name, bytes) in LYRICS_FONTS {
+                std::fs::write(fonts_dir.join(name), bytes)?;
             }
-            filters.push(filter);
+            // Arial en secours pour les caractères absents de Nunito.
+            let system = Path::new(r"C:\Windows\Fonts");
+            for f in ["arial.ttf", "arialbd.ttf"] {
+                let _ = std::fs::copy(system.join(f), fonts_dir.join(f));
+            }
+            filters.push("ass=paroles.ass:fontsdir=fonts".to_string());
         }
         cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
         if filters.is_empty() {

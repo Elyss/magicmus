@@ -1,7 +1,9 @@
 // Compile la bibliothèque C++ Signalsmith Stretch (MIT, intégrée dans vendor/signalsmith)
-// utilisée pour changer la tonalité et la vitesse en temps réel.
+// utilisée pour changer la tonalité et la vitesse en temps réel, et intègre l'icône
+// MagicMus dans les exécutables Windows.
 fn main() {
     println!("cargo::rerun-if-changed=vendor/signalsmith");
+    println!("cargo::rerun-if-changed=assets/magicmus.ico");
     cc::Build::new()
         .file("vendor/signalsmith/wrapper.cpp")
         .include("vendor/signalsmith/signalsmith-stretch")
@@ -11,4 +13,14 @@ fn main() {
         .opt_level(3)
         .flag_if_supported("/EHsc")
         .compile("signalsmith-stretch");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/magicmus.ico")
+            .set("ProductName", "MagicMus")
+            .set("FileDescription", "MagicMus — le karaoké qui fait disparaître la voix");
+        if let Err(e) = res.compile() {
+            println!("cargo::warning=icône non intégrée : {e}");
+        }
+    }
 }

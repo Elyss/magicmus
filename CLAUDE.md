@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Application karaoké Windows en Rust : télécharge une vidéo YouTube, retire la voix par IA, affiche les paroles
+**MagicMus** — application karaoké Windows en Rust : télécharge une vidéo YouTube, retire la voix par IA, affiche les paroles
 synchronisées mot à mot et permet de changer tonalité et vitesse en direct. Interface en français, code commenté en
 français. Voir aussi `README.md`.
 
@@ -13,14 +13,28 @@ cargo test --release           # tests unitaires
 KARAOKE_TEST_FILE=<karaoke_ia.mp4> cargo test --release --test export -- --ignored
 ```
 
-Prérequis : Rust (MSVC) et Visual Studio Build Tools (C++ requis par `build.rs`, qui compile Signalsmith Stretch).
+Prérequis : Rust (MSVC) et Visual Studio Build Tools (C++ requis par `build.rs`, qui compile Signalsmith Stretch
+et intègre l'icône `assets/magicmus.ico` via winresource).
 Pas de libclang : les liaisons FFI de Signalsmith sont écrites à la main dans `src/stretch.rs`.
+
+L'exe livré est `dist\MagicMus.exe` (copie de `target/release/karaoke.exe`).
+
+Vérifier le rendu des écrans sans lancer de traitement (option de compilation `demo`, absente de l'exe livré) :
+
+```bash
+CARGO_TARGET_DIR=target/demo cargo build --release --features demo --bin karaoke
+MAGICMUS_DEMO=traitement target/demo/release/karaoke.exe   # ou MAGICMUS_DEMO=correction
+```
+
+Le build de débogage (`cargo build` sans `--release`) plante au démarrage (erreur de segmentation, cause non
+identifiée, aussi sans le mode démo) : tester avec `--release`.
 
 ## Architecture
 
 | Fichier | Rôle |
 |---|---|
-| `src/main.rs` | GUI egui/eframe 0.37 (`App::ui`, `Panel::left`, `CentralPanel::show(ui, …)`) |
+| `src/main.rs` | GUI egui/eframe 0.37 (`App::ui`, `Panel::left`, `CentralPanel::show(ui, …)`) : écrans accueil, traitement, lecteur, modale de correction |
+| `src/theme.rs` | design MagicMus (maquette Claude Design) : couleurs, polices Nunito / DM Serif Display, composants dessinés à la main |
 | `src/bin/karaoke-cli.rs` | ligne de commande (clap) |
 | `src/pipeline.rs` | enchaînement : outils → téléchargement → décodage → séparation → Whisper → encodage → paroles |
 | `src/setup.rs` | téléchargement automatique (yt-dlp, ffmpeg, Deno, ONNX Runtime, modèles) dans `%LOCALAPPDATA%\Karaoke` |
@@ -45,6 +59,10 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
 - Paroles : texte saisi > LRCLIB > reconnaissance Whisper seule ; le minutage mot à mot vient de Whisper.
 - L'horloge du lecteur est la position audio ; vidéo et paroles la suivent (`Player::position` compense la latence).
 - Les tests utilisent des paroles factices (« un deux trois… ») : ne jamais versionner ni afficher de vraies paroles.
+- Polices Nunito (fontsource) : leurs noms de famille internes sont inhabituels (« Nunito ExtraLight ExtraBold ») ;
+  les sous-titres exportés citent ce nom exact (`lyrics::ASS_FONT`), sinon libass retombe sur Arial.
+- Captures d'écran de test : utiliser `PrintWindow` sur la fenêtre de l'app, pas une capture de l'écran (qui peut
+  montrer ce que l'utilisateur fait par-dessus).
 
 ## État (2026-11-09)
 

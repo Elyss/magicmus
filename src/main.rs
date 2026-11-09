@@ -1,16 +1,23 @@
-﻿//! Application graphique : télécharge une vidéo YouTube, transcrit les paroles,
-//! supprime la voix et lit le karaoké dans la fenêtre (tonalité et vitesse réglables).
+﻿//! MagicMus — application graphique : télécharge une vidéo YouTube, transcrit les
+//! paroles, supprime la voix et lit le karaoké dans la fenêtre (tonalité et vitesse
+//! réglables). Design : maquette « MagicMus design modern » (Claude Design).
 
 // Pas de fenêtre de console en version release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense};
+mod theme;
+
+use eframe::egui::{
+    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, Sense, Stroke,
+    TextFormat, TextureHandle, Vec2,
+};
 use karaoke::export::{self, ExportSettings};
 use karaoke::pipeline::{self, Event, Method, Options, Outcome};
-use karaoke::player::{self, Player};
+use karaoke::player::{self, LyricsStyle, Player};
 use karaoke::{media, tools};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use theme::{self as th, W};
 
 const LANGUAGES: [(&str, &str); 8] = [
     ("auto", "Détection automatique"),
@@ -23,25 +30,65 @@ const LANGUAGES: [(&str, &str); 8] = [
     ("ja", "Japonais"),
 ];
 
+/// Étapes affichées pendant la création, dans l'ordre du traitement.
+const STEPS: [&str; 7] = [
+    "Préparation des outils",
+    "Téléchargement de la vidéo",
+    "Décodage de l'audio",
+    "Séparation de la voix",
+    "Reconnaissance des paroles",
+    "Encodage du karaoké",
+    "Synchronisation des paroles",
+];
+const LYRICS_STEPS: [usize; 2] = [4, 6];
+
+/// Étape correspondant à un message du traitement (`None` : étape inchangée,
+/// par exemple le téléchargement d'un outil au premier usage).
+fn step_of(stage: &str) -> Option<usize> {
+    let s = stage.to_lowercase();
+    let starts = |p: &str| s.starts_with(p);
+    if starts("vérification des outils") {
+        Some(0)
+    } else if s.contains("informations de la vidéo") || starts("téléchargement de la vidéo") || starts("mise à jour de yt-dlp") {
+        Some(1)
+    } else if starts("décodage") {
+        Some(2)
+    } else if starts("séparation") || starts("suppression de la voix") {
+        Some(3)
+    } else if starts("reconnaissance des paroles") {
+        Some(4)
+    } else if starts("encodage") {
+        Some(5)
+    } else if starts("synchronisation") {
+        Some(6)
+    } else {
+        None
+    }
+}
+
 fn main() -> eframe::Result {
     tools::setup_path();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Karaoké")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 600.0]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("MagicMus")
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([1040.0, 680.0]);
+    if let Some(icon) = th::window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     // Un fichier passé en argument (« Ouvrir avec… ») est ouvert directement.
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
     eframe::run_native(
-        "Karaoké",
+        "MagicMus",
         options,
-        Box::new(move |_cc| {
-            let mut app = App::default();
+        Box::new(move |cc| {
+            th::install(&cc.egui_ctx);
+            let mut app = App::new(th::logo(&cc.egui_ctx));
             if let Some(path) = arg.filter(|p| p.is_file()) {
                 app.open_path(path);
             }
+            #[cfg(feature = "demo")]
+            app.demo(std::env::var("MAGICMUS_DEMO").ok().as_deref());
             Ok(Box::new(app))
         }),
     )
@@ -52,14 +99,21 @@ enum Msg {
     Finished(Result<Outcome, String>),
 }
 
-/// Tâche de fond (traitement ou enregistrement) et son état d'avancement.
+enum ExportMsg {
+    Progress(String, Option<f32>),
+    Done(Result<PathBuf, String>),
+}
+
+/// Avancement d'une tâche de fond.
 #[derive(Default)]
 struct Task {
     stage: String,
     progress: Option<f32>,
+    step: usize,
 }
 
 struct App {
+    logo: TextureHandle,
     opts: Options,
     auto_play: bool,
     rx: Option<Receiver<Msg>>,
@@ -68,11 +122,20 @@ struct App {
     warnings: Vec<String>,
     error: Option<String>,
 
+    // Panneau de gauche
+    paste_open: bool,
+    options_open: bool,
+    journal_open: bool,
+
+    // Lecteur
     player: Option<Player>,
     has_video: bool,
     show_lyrics: bool,
     seek_drag: Option<f64>,
+    highlight: usize,
+    lyrics_size: f32,
 
+    // Paroles et enregistrement
     burn_lyrics: bool,
     lyrics_editor: Option<String>,
     export_rx: Option<Receiver<ExportMsg>>,
@@ -80,17 +143,13 @@ struct App {
     export_result: Option<Result<PathBuf, String>>,
 }
 
-enum ExportMsg {
-    Progress(String, Option<f32>),
-    Done(Result<PathBuf, String>),
-}
-
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    fn new(logo: TextureHandle) -> Self {
         let out_dir = std::env::var_os("USERPROFILE")
             .map(|h| PathBuf::from(h).join("Music").join("Karaoke"))
             .unwrap_or_else(|| PathBuf::from("karaoke_out"));
         Self {
+            logo,
             opts: Options { out_dir, ..Options::default() },
             auto_play: true,
             rx: None,
@@ -98,10 +157,15 @@ impl Default for App {
             log: Vec::new(),
             warnings: Vec::new(),
             error: None,
+            paste_open: false,
+            options_open: false,
+            journal_open: false,
             player: None,
             has_video: false,
             show_lyrics: true,
             seek_drag: None,
+            highlight: 0,
+            lyrics_size: 36.0,
             burn_lyrics: true,
             lyrics_editor: None,
             export_rx: None,
@@ -109,16 +173,32 @@ impl Default for App {
             export_result: None,
         }
     }
-}
 
-fn fmt_time(t: f64) -> String {
-    let s = t.max(0.0) as u64;
-    format!("{}:{:02}", s / 60, s % 60)
-}
-
-impl App {
     fn running(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// Écrans de démonstration (option de compilation « demo » uniquement), pour vérifier le
+    /// rendu sans lancer de traitement : MAGICMUS_DEMO=traitement | correction.
+    #[cfg(feature = "demo")]
+    fn demo(&mut self, which: Option<&str>) {
+        match which {
+            Some("traitement") => {
+                let (tx, rx) = mpsc::channel();
+                std::mem::forget(tx); // le « traitement » ne se termine jamais
+                self.rx = Some(rx);
+                self.opts.input = "https://www.youtube.com/watch?v=exemple".into();
+                self.task = Task { stage: "Séparation voix / musique par IA".into(), progress: Some(0.42), step: 3 };
+            }
+            Some("correction") => {
+                self.lyrics_editor = Some("un deux trois quatre\ncinq six sept huit\nneuf dix onze douze".into());
+            }
+            _ => {}
+        }
+    }
+
+    fn highlight_color(&self) -> Color32 {
+        th::HIGHLIGHTS[self.highlight].0
     }
 
     // ───────────────────────────── Traitement ─────────────────────────────
@@ -127,7 +207,10 @@ impl App {
         self.log.clear();
         self.warnings.clear();
         self.error = None;
-        self.task = Task { stage: "Démarrage".into(), progress: None };
+        self.task = Task { stage: "Démarrage".into(), progress: None, step: 0 };
+        if let Some(p) = &self.player {
+            p.pause();
+        }
 
         let opts = self.opts.clone();
         let (tx, rx) = mpsc::channel();
@@ -165,6 +248,9 @@ impl App {
             match e {
                 Event::Stage(s) => {
                     self.log.push(format!("— {s}"));
+                    if let Some(step) = step_of(&s) {
+                        self.task.step = self.task.step.max(step);
+                    }
                     self.task.stage = s;
                     self.task.progress = None;
                 }
@@ -185,6 +271,7 @@ impl App {
                 Ok(out) => {
                     // Les paroles saisies ont été enregistrées avec ce morceau.
                     self.opts.lyrics_text.clear();
+                    self.paste_open = false;
                     self.load(out)
                 }
                 Err(e) => {
@@ -250,11 +337,12 @@ impl App {
 
         let source = p.path.clone();
         let lyrics = p.lyrics.clone();
-        let settings = ExportSettings { tempo, semitones, burn_lyrics: self.burn_lyrics };
+        let hl = self.highlight_color();
+        let settings = ExportSettings { tempo, semitones, burn_lyrics: self.burn_lyrics, highlight: [hl.r(), hl.g(), hl.b()] };
         let (tx, rx) = mpsc::channel();
         self.export_rx = Some(rx);
         self.export_result = None;
-        self.export_task = Task { stage: "Préparation".into(), progress: None };
+        self.export_task = Task { stage: "Préparation".into(), ..Task::default() };
         std::thread::spawn(move || {
             let mut progress = |s: &str, p: Option<f32>| {
                 let _ = tx.send(ExportMsg::Progress(s.to_string(), p));
@@ -272,7 +360,7 @@ impl App {
         let Some(rx) = &self.export_rx else { return };
         loop {
             match rx.try_recv() {
-                Ok(ExportMsg::Progress(s, p)) => self.export_task = Task { stage: s, progress: p },
+                Ok(ExportMsg::Progress(s, p)) => self.export_task = Task { stage: s, progress: p, step: 0 },
                 Ok(ExportMsg::Done(r)) => {
                     self.export_result = Some(r);
                     self.export_rx = None;
@@ -291,273 +379,508 @@ impl App {
     // ───────────────────────────── Panneau gauche ─────────────────────────────
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.heading(RichText::new("Karaoké").size(26.0));
-        ui.label("Télécharge une vidéo YouTube, affiche les paroles et retire la voix.");
-        ui.small("Aucune installation : les outils se téléchargent automatiquement au premier usage.");
-        ui.separator();
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            self.form(ui);
-            ui.add_space(10.0);
-            let can_start = !self.running() && !self.opts.input.trim().is_empty();
-            let button = egui::Button::new(RichText::new("Créer le karaoké").size(17.0).strong())
-                .min_size(egui::vec2(ui.available_width(), 38.0));
-            if ui.add_enabled(can_start, button).clicked() {
-                self.start(ui.ctx().clone());
-            }
-            if ui.button("Ouvrir un karaoké déjà créé…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Karaoké", &["mp4", "m4a"])
-                    .set_directory(&self.opts.out_dir)
-                    .pick_file()
-                {
-                    self.load(Outcome::open(&p));
-                }
-            }
-            ui.add_space(8.0);
-            self.status(ui);
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new("Journal").show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("journal")
-                    .max_height(200.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for l in &self.log {
-                            ui.label(RichText::new(l).monospace().size(11.0));
-                        }
+        // Marque
+        egui::Panel::top("marque")
+            .show_separator_line(false)
+            .frame(Frame::new().inner_margin(Margin { left: 24, right: 24, top: 24, bottom: 18 }))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    th::logo_disc(ui, &self.logo, 58.0, 52.0, th::ROSE_SOFT, 3.0);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(6.0);
+                        let mut job = LayoutJob::default();
+                        job.append("Magic", 0.0, fmt(30.0, W::Serif, th::INK));
+                        job.append("Mus", 0.0, fmt(30.0, W::SerifItalic, th::ROSE));
+                        ui.label(job);
+                        ui.label(th::t("Le karaoké qui fait disparaître la voix", 13.0, W::Medium, th::MUTED));
                     });
+                });
             });
-        });
+
+        // Bouton de création, toujours visible en bas
+        egui::Panel::bottom("creer")
+            .show_separator_line(false)
+            .frame(Frame::new().fill(th::PANEL).inner_margin(Margin { left: 24, right: 24, top: 16, bottom: 18 }))
+            .show(ui, |ui| {
+                let top = ui.max_rect().top() - 16.0;
+                ui.painter().hline(ui.max_rect().x_range().expand(24.0), top, Stroke::new(1.0, th::BORDER));
+                let running = self.running();
+                let can_start = !running && !self.opts.input.trim().is_empty();
+                let label = if running { "Création en cours…" } else { "Créer le karaoké" };
+                if th::primary(ui, label, Vec2::new(ui.available_width(), 50.0), 16.0, can_start).clicked() {
+                    self.start(ui.ctx().clone());
+                }
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    if th::link(ui, "Ouvrir un karaoké déjà créé…", th::MUTED).clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Karaoké", &["mp4", "m4a"])
+                            .set_directory(&self.opts.out_dir)
+                            .pick_file()
+                        {
+                            self.load(Outcome::open(&p));
+                        }
+                    }
+                });
+            });
+
+        // Formulaire défilant
+        egui::CentralPanel::default()
+            .frame(Frame::new().inner_margin(Margin { left: 24, right: 18, top: 4, bottom: 8 }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_width(ui.available_width() - 6.0);
+                    let running = self.running();
+                    if running {
+                        ui.multiply_opacity(0.5);
+                    }
+                    ui.add_enabled_ui(!running, |ui| self.form(ui));
+                });
+            });
     }
 
     fn form(&mut self, ui: &mut egui::Ui) {
-        let enabled = !self.running();
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.label(RichText::new("Vidéo YouTube ou fichier").strong());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.opts.input)
-                    .hint_text("https://www.youtube.com/watch?v=…")
-                    .desired_width(f32::INFINITY),
-            );
-            if ui.button("Choisir un fichier…").clicked() {
+        ui.spacing_mut().item_spacing.y = 10.0;
+
+        // Source
+        th::section_label(ui, "Vidéo YouTube ou fichier", th::FAINT);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.opts.input)
+                .hint_text("https://www.youtube.com/watch?v=…")
+                .font(th::font(14.0, W::Medium))
+                .text_color(th::INK)
+                .margin(Margin::symmetric(14, 12))
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal(|ui| {
+            if th::secondary(ui, "Choisir un fichier…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter(
-                        "Audio / vidéo",
-                        &["mp4", "mkv", "webm", "mov", "avi", "mp3", "m4a", "wav", "flac", "ogg", "opus"],
-                    )
+                    .add_filter("Audio / vidéo", &["mp4", "mkv", "webm", "mov", "avi", "mp3", "m4a", "wav", "flac", "ogg", "opus"])
                     .pick_file()
                 {
                     self.opts.input = p.display().to_string();
                 }
             }
+            ui.label(th::t("ou glissez-le sur la fenêtre", 12.0, W::Medium, th::FAINT));
+        });
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("Suppression de la voix").strong());
-            ui.radio_value(&mut self.opts.method, Method::Ia, "Qualité : IA (≈ 1 min par chanson)");
-            ui.radio_value(&mut self.opts.method, Method::Spectral, "Rapide : canal central (quelques s)");
-            if self.opts.method == Method::Spectral {
-                ui.add(egui::Slider::new(&mut self.opts.strength, 0.0..=1.0).text("Intensité").fixed_decimals(2));
+        // Méthode
+        ui.add_space(12.0);
+        th::section_label(ui, "Suppression de la voix", th::FAINT);
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 10.0) / 2.0;
+            if th::choice_card(ui, self.opts.method == Method::Ia, "Qualité", "Par IA · ≈ 1 min par chanson", w).clicked() {
+                self.opts.method = Method::Ia;
             }
+            if th::choice_card(ui, self.opts.method == Method::Spectral, "Rapide", "Canal central · quelques s", w).clicked() {
+                self.opts.method = Method::Spectral;
+            }
+        });
+        if self.opts.method == Method::Spectral {
+            ui.horizontal(|ui| {
+                ui.label(th::t("Intensité", 13.0, W::Bold, th::INK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(th::t(format!("{:.2}", self.opts.strength).replace('.', ","), 13.0, W::Bold, th::ROSE));
+                });
+            });
+            let mut v = self.opts.strength as f64;
+            if th::slider(ui, &mut v, 0.0..=1.0, 0.01, 0.0, ui.available_width()).changed() {
+                self.opts.strength = v as f32;
+            }
+        }
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("Paroles").strong());
-            ui.checkbox(&mut self.opts.lyrics, "Afficher les paroles synchronisées");
-            ui.add_enabled_ui(self.opts.lyrics, |ui| {
-                let current = LANGUAGES
-                    .iter()
-                    .find(|(c, _)| *c == self.opts.language)
-                    .map_or("?", |(_, n)| *n);
-                egui::ComboBox::from_label("Langue")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (code, name) in LANGUAGES {
-                            ui.selectable_value(&mut self.opts.language, code.to_string(), name);
-                        }
+        // Paroles
+        ui.add_space(12.0);
+        th::section_label(ui, "Paroles", th::FAINT);
+        th::switch_row(ui, "Paroles synchronisées", &mut self.opts.lyrics);
+        let lyrics_on = self.opts.lyrics;
+        ui.scope(|ui| {
+            if !lyrics_on {
+                ui.multiply_opacity(0.4);
+            }
+            ui.add_enabled_ui(lyrics_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(th::t("Langue", 14.0, W::Semi, th::INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let current = LANGUAGES.iter().find(|(c, _)| *c == self.opts.language).map_or("?", |(_, n)| *n);
+                        egui::ComboBox::from_id_salt("langue")
+                            .selected_text(th::t(current, 13.0, W::Semi, th::INK))
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for (code, name) in LANGUAGES {
+                                    ui.selectable_value(&mut self.opts.language, code.to_string(), name);
+                                }
+                            });
                     });
-                ui.checkbox(&mut self.opts.lyrics_online, "Chercher les paroles exactes en ligne (LRCLIB)");
-                egui::CollapsingHeader::new("Coller les paroles exactes (facultatif)").show(ui, |ui| {
+                });
+                th::switch_row(ui, "Chercher les paroles exactes en ligne (LRCLIB)", &mut self.opts.lyrics_online);
+                if disclosure(ui, "Coller les paroles exactes (facultatif)", self.paste_open, 13.0, W::Bold, th::ROSE).clicked() {
+                    self.paste_open = !self.paste_open;
+                }
+                if self.paste_open {
                     ui.add(
                         egui::TextEdit::multiline(&mut self.opts.lyrics_text)
                             .hint_text("Une ligne par vers. Les horodatages LRC [mm:ss.xx] sont acceptés.")
-                            .desired_rows(6)
+                            .font(th::font(13.0, W::Medium))
+                            .margin(Margin::symmetric(12, 10))
+                            .desired_rows(5)
                             .desired_width(f32::INFINITY),
                     );
+                }
+                ui.add(
+                    egui::Label::new(th::t(
+                        "Le minutage de chaque mot vient de la reconnaissance vocale (Whisper, ≈ 550 Mo au premier usage).",
+                        12.0,
+                        W::Medium,
+                        th::FAINT,
+                    ))
+                    .wrap(),
+                );
+            });
+        });
+
+        // Options
+        ui.add_space(12.0);
+        if disclosure(ui, "OPTIONS", self.options_open, 11.0, W::Black, th::FAINT).clicked() {
+            self.options_open = !self.options_open;
+        }
+        if self.options_open {
+            th::checkbox(ui, &mut self.opts.audio_only, "Audio seulement (pas de vidéo)", true);
+            th::checkbox(ui, &mut self.auto_play, "Lancer la lecture à la fin", true);
+            th::checkbox(ui, &mut self.opts.force, "Tout refaire, même si déjà traité", true);
+            Frame::new().fill(th::BG).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let change = ui
+                        .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let r = th::link(ui, "Changer…", th::ROSE);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.opts.out_dir.display().to_string()).monospace().size(12.0).color(th::MUTED),
+                                )
+                                .truncate(),
+                            );
+                            r
+                        })
+                        .inner;
+                    if change.clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_directory(&self.opts.out_dir).pick_folder() {
+                            self.opts.out_dir = d;
+                        }
+                    }
                 });
-                ui.small("Le minutage de chaque mot vient de la reconnaissance vocale (Whisper, ≈ 550 Mo au premier usage).");
             });
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("Options").strong());
-            ui.checkbox(&mut self.opts.audio_only, "Audio seulement (pas de vidéo)");
-            ui.checkbox(&mut self.auto_play, "Lancer la lecture à la fin");
-            ui.checkbox(&mut self.opts.force, "Tout refaire, même si déjà traité");
+            ui.add_space(4.0);
+            ui.label(th::t("Couleur des mots chantés", 14.0, W::Semi, th::INK));
             ui.horizontal(|ui| {
-                ui.label("Dossier :");
-                if ui.button("Changer…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.opts.out_dir).pick_folder() {
-                        self.opts.out_dir = d;
+                for (i, (c, name)) in th::HIGHLIGHTS.iter().enumerate() {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(44.0, 30.0), Sense::click());
+                    let sel = self.highlight == i;
+                    ui.painter().rect(
+                        r,
+                        CornerRadius::same(8),
+                        *c,
+                        Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { th::INK } else { th::BORDER_INPUT }),
+                        egui::StrokeKind::Inside,
+                    );
+                    if resp.on_hover_text(*name).clicked() {
+                        self.highlight = i;
                     }
                 }
             });
-            ui.add(egui::Label::new(RichText::new(self.opts.out_dir.display().to_string()).weak().small()).truncate());
+            ui.horizontal(|ui| {
+                ui.label(th::t("Taille des paroles", 14.0, W::Semi, th::INK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(th::t(format!("{} px", self.lyrics_size as i32), 13.0, W::Bold, th::ROSE));
+                });
+            });
+            let mut size = self.lyrics_size as f64;
+            if th::slider(ui, &mut size, 24.0..=52.0, 2.0, 24.0, ui.available_width()).changed() {
+                self.lyrics_size = size as f32;
+            }
+
+            if disclosure(ui, "Journal", self.journal_open, 13.0, W::Bold, th::MUTED).clicked() {
+                self.journal_open = !self.journal_open;
+            }
+            if self.journal_open {
+                egui::ScrollArea::vertical().id_salt("journal").max_height(200.0).stick_to_bottom(true).show(ui, |ui| {
+                    for l in &self.log {
+                        ui.label(egui::RichText::new(l).monospace().size(11.0).color(th::MUTED));
+                    }
+                });
+            }
+        }
+    }
+
+    // ───────────────────────────── Zone principale ─────────────────────────────
+
+    /// Avertissements et erreurs, au-dessus de l'écran courant.
+    fn banners(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        if let Some(e) = &self.error {
+            banner(ui, &format!("Erreur : {e}"), Color32::from_rgb(0xfb, 0xe9, 0xec), Color32::from_rgb(0xa3, 0x2b, 0x48), &mut close);
+            if close {
+                self.error = None;
+            }
+        }
+        if !self.running() {
+            let mut i = 0;
+            while i < self.warnings.len() {
+                let mut c = false;
+                banner(ui, &self.warnings[i], Color32::from_rgb(0xfd, 0xf3, 0xe1), Color32::from_rgb(0x8a, 0x5a, 0x00), &mut c);
+                if c {
+                    self.warnings.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_height();
+        ui.vertical_centered(|ui| {
+            ui.add_space(((avail - 560.0) / 2.0).max(0.0));
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(260.0), Sense::hover());
+            th::radial_disc(ui.painter(), rect.center(), 130.0, th::ROSE_SOFT, th::BG);
+            th::paint_logo(ui.painter(), &self.logo, rect.center(), 230.0);
+            ui.add_space(22.0);
+            let mut job = LayoutJob::default();
+            job.append("Une chanson, un coup de chapeau, ", 0.0, fmt(44.0, W::Serif, th::INK));
+            job.append("et la voix s'envole.", 0.0, fmt(44.0, W::SerifItalic, th::ROSE));
+            job.wrap.max_width = 560.0;
+            job.halign = Align::Center;
+            // Mise en page préalable : la largeur de 560 px est respectée.
+            let galley = ui.painter().layout_job(job);
+            ui.label(galley);
+            ui.add_space(14.0);
+            ui.add_sized(
+                [460.0, 50.0],
+                egui::Label::new(th::t(
+                    "Collez une adresse YouTube à gauche puis cliquez sur « Créer le karaoké ». La vidéo s'affichera ici.",
+                    16.0,
+                    W::Medium,
+                    th::MUTED,
+                ))
+                .wrap()
+                .halign(Align::Center),
+            );
+            ui.add_space(14.0);
+            centered_row(ui, 300.0, |ui| {
+                th::chip(ui, "Aucune installation", None);
+                th::chip(ui, "Glisser-déposer accepté", None);
+            });
         });
     }
 
-    fn status(&mut self, ui: &mut egui::Ui) {
-        if self.running() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(&self.task.stage).strong());
+    fn processing(&mut self, ui: &mut egui::Ui) {
+        let steps: Vec<usize> = (0..STEPS.len()).filter(|i| self.opts.lyrics || !LYRICS_STEPS.contains(i)).collect();
+        let cur = steps.iter().position(|&s| s >= self.task.step).unwrap_or(steps.len() - 1);
+        let step_p = self.task.progress.unwrap_or(0.0);
+        let total = (cur as f32 + step_p) / steps.len() as f32;
+        let time = ui.input(|i| i.time);
+        let avail = ui.available_height();
+
+        ui.vertical_centered(|ui| {
+            ui.add_space(((avail - 600.0) / 2.0).max(0.0));
+            let bob = (time * 1.6).sin() as f32 * 5.0;
+            th::logo_disc(ui, &self.logo, 170.0, 150.0, th::ROSE_SOFT, bob);
+            ui.add_space(18.0);
+            let mut job = LayoutJob::default();
+            job.append("Un peu de ", 0.0, fmt(38.0, W::Serif, th::INK));
+            job.append("magie", 0.0, fmt(38.0, W::SerifItalic, th::ROSE));
+            job.append("…", 0.0, fmt(38.0, W::Serif, th::INK));
+            ui.label(job);
+            ui.add_space(18.0);
+
+            centered_row(ui, 440.0, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(440.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(th::t(&self.task.stage, 14.0, W::Bold, th::INK)).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let pct = self.task.progress.map_or(String::new(), |p| format!("{} %", (p * 100.0).round()));
+                            ui.label(th::t(pct, 14.0, W::Bold, th::ROSE));
+                        });
+                    });
+                    th::progress(ui, total, 440.0, 10.0);
+                    ui.add_space(8.0);
+                    th::card(16, Margin::symmetric(18, 14)).show(ui, |ui| {
+                        ui.set_width(440.0 - 36.0);
+                        ui.spacing_mut().item_spacing.y = 9.0;
+                        for (k, &s) in steps.iter().enumerate() {
+                            let (done, now) = (k < cur, k == cur);
+                            ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                                let c = r.center();
+                                let p = ui.painter();
+                                if done {
+                                    p.circle_filled(c, 10.0, th::ROSE);
+                                    p.line(
+                                        vec![c + Vec2::new(-4.5, 0.2), c + Vec2::new(-1.2, 3.4), c + Vec2::new(4.6, -3.4)],
+                                        Stroke::new(2.0, Color32::WHITE),
+                                    );
+                                } else {
+                                    p.circle(c, 9.25, if now { th::ROSE_SOFT } else { Color32::TRANSPARENT }, Stroke::new(1.5, if now { th::ROSE } else { th::STEP_BORDER }));
+                                }
+                                let color = if done { th::MUTED } else if now { th::INK } else { th::STEP_TODO };
+                                ui.label(th::t(STEPS[s], 14.0, W::Semi, color));
+                            });
+                        }
+                    });
+                    for w in &self.warnings {
+                        ui.add(egui::Label::new(th::t(format!("⚠ {w}"), 12.0, W::Semi, Color32::from_rgb(0x8a, 0x5a, 0x00))).wrap());
+                    }
+                });
             });
-            progress_bar(ui, self.task.progress);
-        }
-        for w in &self.warnings {
-            ui.colored_label(Color32::from_rgb(0xd0, 0x8a, 0x00), format!("⚠ {w}"));
-        }
-        if let Some(e) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, format!("Erreur : {e}"));
-        }
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    // ───────────────────────────── Lecteur ─────────────────────────────
-
     fn player_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(p) = &mut self.player else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("Collez une adresse YouTube à gauche puis cliquez sur « Créer le karaoké ».\nLa vidéo s'affichera ici.")
-                        .size(16.0)
-                        .weak(),
-                );
-            });
-            return;
-        };
-
         let ctx = ui.ctx().clone();
+        let Some(p) = &mut self.player else { return };
         let duration = p.duration();
         let t = self.seek_drag.unwrap_or_else(|| p.position());
         p.update_video(&ctx, t);
+        ui.spacing_mut().item_spacing.y = 16.0;
 
-        ui.label(RichText::new(&p.title).size(18.0).strong());
-
-        // Zone d'image (proportions conservées, centrée).
-        let controls_h = 150.0;
-        let avail = ui.available_size();
-        let aspect = p.aspect();
-        let mut h = (avail.x / aspect).min((avail.y - controls_h).max(120.0));
-        let w = (h * aspect).min(avail.x);
-        h = w / aspect;
-        let (area, resp) = ui.allocate_exact_size(egui::vec2(avail.x, h), Sense::click());
-        let img = Rect::from_center_size(area.center(), egui::vec2(w, h));
-        let painter = ui.painter_at(area);
-        painter.rect_filled(img, 6.0, Color32::BLACK);
-        match p.texture() {
-            Some(tex) => {
-                painter.image(tex.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            }
-            None if !p.has_video() => {
-                painter.text(
-                    img.center() - egui::vec2(0.0, h * 0.2),
-                    egui::Align2::CENTER_CENTER,
-                    "♫",
-                    egui::FontId::proportional(h * 0.25),
-                    Color32::from_gray(70),
-                );
-            }
-            None => {}
+        // En-tête : titre, origine, dossier
+        let method = if p.path.file_name().is_some_and(|n| n.to_string_lossy().contains("rapide")) { "rapide" } else { "IA" };
+        let mut origin = format!("Karaoké {method}");
+        if let Some(src) = p.lyrics.as_ref().map(|l| l.source.clone()).filter(|s| !s.is_empty()) {
+            origin.push_str(&format!(" · paroles {src}"));
         }
-        if self.show_lyrics {
+        let mut reveal = false;
+        ui.horizontal(|ui| {
+            let right = 380.0;
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - right).max(200.0));
+                ui.spacing_mut().item_spacing.y = 6.0;
+                th::section_label(ui, "En scène", th::ROSE);
+                ui.add(egui::Label::new(th::t(&p.title, 30.0, W::Serif, th::INK)).truncate());
+            });
+            ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                reveal = th::secondary(ui, "Afficher dans le dossier").clicked();
+                th::chip(ui, &origin, Some(th::PANEL));
+            });
+        });
+        if reveal {
+            let _ = media::reveal(&p.path);
+        }
+
+        // Image, paroles et repères
+        let below = 72.0 + 76.0 + 36.0 + 3.0 * 16.0;
+        let w = ui.available_width();
+        let h = (ui.available_height() - below).max(160.0);
+        let (area, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, CornerRadius::same(22), th::VIDEO_BG);
+        if let Some(tex) = p.texture() {
+            let a = p.aspect();
+            let (iw, ih) = if area.width() / area.height() > a { (area.height() * a, area.height()) } else { (area.width(), area.width() / a) };
+            let img = Rect::from_center_size(area.center(), Vec2::new(iw, ih));
+            let fills = (iw - area.width()).abs() < 2.0 && (ih - area.height()).abs() < 2.0;
+            egui::Image::from_texture((tex.id(), img.size()))
+                .corner_radius(if fills { 22 } else { 0 })
+                .paint_at(ui, img);
+        } else if !p.has_video() {
+            th::paint_logo(&painter, &self.logo, area.center() - Vec2::new(0.0, h * 0.12), h * 0.38);
+        }
+        let lyrics_visible = self.show_lyrics && p.lyrics.is_some();
+        if lyrics_visible {
+            // Dégradé sombre sous les paroles (les coins arrondis restent intacts).
+            let g_top = area.bottom() - (h * 0.45).min(260.0);
+            let shade = Color32::from_rgba_unmultiplied(29, 24, 32, 217);
+            th::vertical_gradient(&painter, Rect::from_min_max(Pos2::new(area.left(), g_top), Pos2::new(area.right(), area.bottom() - 22.0)), Color32::TRANSPARENT, shade);
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(area.left(), area.bottom() - 22.0), area.max),
+                CornerRadius { nw: 0, ne: 0, sw: 22, se: 22 },
+                shade,
+            );
+            let style = LyricsStyle {
+                size: self.lyrics_size * (h / 470.0).clamp(0.6, 1.6),
+                highlight: th::HIGHLIGHTS[self.highlight].0,
+                current: th::family(W::Black),
+                next: th::family(W::Bold),
+            };
             if let Some(ly) = &p.lyrics {
-                player::draw_lyrics(&painter, img, ly, t);
+                player::draw_lyrics(&painter, area.shrink2(Vec2::new(40.0, 0.0)), ly, t, &style);
             }
         }
         if p.original() {
-            // Repère visuel : on écoute la version originale.
-            let badge = Rect::from_min_size(img.min + egui::vec2(12.0, 12.0), egui::vec2(190.0, 30.0));
-            painter.rect_filled(badge, 6.0, Color32::from_rgba_unmultiplied(200, 40, 40, 220));
-            painter.text(
-                badge.center(),
-                egui::Align2::CENTER_CENTER,
-                "🎤 VERSION ORIGINALE",
-                egui::FontId::proportional(15.0),
-                Color32::WHITE,
-            );
+            pill(&painter, area.left_top() + Vec2::new(16.0, 16.0), Align2::LEFT_TOP, "VERSION ORIGINALE", th::ROSE, Color32::WHITE, true);
+        }
+        if !p.is_playing() {
+            pill(&painter, area.right_top() + Vec2::new(-16.0, 16.0), Align2::RIGHT_TOP, "En pause · Espace pour reprendre", Color32::from_white_alpha(30), Color32::WHITE, false);
         }
         if resp.clicked() {
             p.toggle();
         }
 
-        ui.add_space(6.0);
         // Barre de lecture
-        ui.horizontal(|ui| {
-            let label = if p.is_playing() { "⏸ Pause" } else { "⏵ Lecture" };
-            if ui.add(egui::Button::new(RichText::new(label).size(15.0)).min_size(egui::vec2(96.0, 28.0))).clicked() {
-                p.toggle();
-            }
-            // Comparaison avec l'original (avec la voix), à tout moment.
-            let mut original = p.original();
-            let ready = p.original_available();
-            let text = if original { "🎤 Voix : originale" } else { "🎤 Voix : retirée" };
-            let r = ui
-                .add_enabled_ui(ready, |ui| ui.toggle_value(&mut original, RichText::new(text).size(15.0)))
-                .inner
-                .on_hover_text("Basculer entre le karaoké et la version originale (touche V)")
-                .on_disabled_hover_text("Version originale en cours de chargement… (ou introuvable)");
-            if r.changed() {
-                p.set_original(original);
-            }
-            ui.label(RichText::new(format!("{} / {}", fmt_time(t), fmt_time(duration))).monospace());
-            let mut pos = t;
-            ui.spacing_mut().slider_width = (ui.available_width() - 10.0).max(50.0);
-            let r = ui.add(egui::Slider::new(&mut pos, 0.0..=duration.max(0.1)).show_value(false));
-            if r.dragged() {
-                self.seek_drag = Some(pos);
-            }
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                p.seek(pos);
-                self.seek_drag = None;
-            }
+        th::card(18, Margin::symmetric(16, 12)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
+                if th::play_button(ui, p.is_playing()).clicked() {
+                    p.toggle();
+                }
+                let mut job = LayoutJob::default();
+                job.append(&fmt_time(t), 0.0, fmt(14.0, W::Bold, th::INK));
+                job.append(&format!(" / {}", fmt_time(duration)), 0.0, fmt(14.0, W::Semi, th::FAINT));
+                ui.label(job);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    th::keycap(ui, "V");
+                    let mut original = p.original();
+                    let ready = p.original_available();
+                    let r = th::segmented(ui, &mut original, "Voix retirée", "Originale", ready)
+                        .on_hover_text("Basculer entre le karaoké et la version originale (touche V)")
+                        .on_disabled_hover_text("Version originale en cours de chargement…");
+                    if r.changed() {
+                        p.set_original(original);
+                    }
+                    ui.add_space(8.0);
+                    let mut pos = t;
+                    let r = th::slider(ui, &mut pos, 0.0..=duration.max(0.1), 0.0, 0.0, ui.available_width());
+                    if r.dragged() {
+                        self.seek_drag = Some(pos);
+                    }
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        p.seek(pos);
+                        self.seek_drag = None;
+                    }
+                });
+            });
         });
 
         // Tonalité, vitesse, volume
         ui.horizontal(|ui| {
-            ui.spacing_mut().slider_width = 150.0;
-            let mut semi = p.semitones();
-            ui.label("Tonalité");
-            if ui
-                .add(
-                    egui::Slider::new(&mut semi, player::SEMITONE_RANGE)
-                        .step_by(0.5)
-                        .custom_formatter(|v, _| if v == 0.0 { "0".into() } else { format!("{v:+}") })
-                        .suffix(" ½ton"),
-                )
-                .changed()
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let reset_w = 120.0;
+            let cw = (ui.available_width() - reset_w - 3.0 * 12.0) / 3.0;
+            let semi = p.semitones() as f64;
+            let semi_label = if semi == 0.0 {
+                "0".to_string()
+            } else {
+                format!("{}{} ½ ton", if semi > 0.0 { "+" } else { "−" }, format!("{}", semi.abs()).replace('.', ","))
+            };
+            if let Some(v) = knob(ui, cw, "Tonalité", &semi_label, semi, -12.0..=12.0, 0.5, 0.0) {
+                p.set_semitones(v as f32);
+            }
+            let tempo = (p.tempo() * 100.0).round() as f64;
+            if let Some(v) = knob(ui, cw, "Vitesse", &format!("{tempo} %"), tempo, 50.0..=150.0, 5.0, 100.0) {
+                p.set_tempo(v as f32 / 100.0);
+            }
+            let vol = (p.volume() * 100.0).round() as f64;
+            if let Some(v) = knob(ui, cw, "Volume", &format!("{vol} %"), vol, 0.0..=150.0, 1.0, 0.0) {
+                p.set_volume(v as f32 / 100.0);
+            }
+            if th::secondary_sized(ui, "Réinitialiser", Vec2::new(reset_w, 76.0), 16)
+                .on_hover_text("Tonalité et vitesse d'origine")
+                .clicked()
             {
-                p.set_semitones(semi);
-            }
-            ui.add_space(12.0);
-            let mut tempo = p.tempo() * 100.0;
-            ui.label("Vitesse");
-            if ui
-                .add(
-                    egui::Slider::new(&mut tempo, 50.0..=150.0)
-                        .step_by(5.0)
-                        .suffix(" %"),
-                )
-                .changed()
-            {
-                p.set_tempo(tempo / 100.0);
-            }
-            ui.add_space(12.0);
-            let mut vol = p.volume() * 100.0;
-            ui.label("Volume");
-            ui.spacing_mut().slider_width = 90.0;
-            if ui.add(egui::Slider::new(&mut vol, 0.0..=150.0).show_value(false)).changed() {
-                p.set_volume(vol / 100.0);
-            }
-            if ui.button("Réinitialiser").on_hover_text("Tonalité et vitesse d'origine").clicked() {
                 p.set_semitones(0.0);
                 p.set_tempo(1.0);
             }
@@ -565,138 +888,153 @@ impl App {
 
         // Paroles et enregistrement
         let has_lyrics = p.lyrics.is_some();
-        let mut open_editor = false;
-        let (mut show_lyrics, mut burn_lyrics) = (self.show_lyrics, self.burn_lyrics);
-        let (exporting, has_video) = (self.export_rx.is_some(), self.has_video);
-        let (mut do_export, mut do_reveal) = (false, false);
+        let (mut open_editor, mut do_export) = (false, false);
+        let exporting = self.export_rx.is_some();
         ui.horizontal(|ui| {
-            ui.add_enabled(has_lyrics, egui::Checkbox::new(&mut show_lyrics, "Paroles à l'écran"));
-            if let Some(ly) = &mut p.lyrics {
-                ui.label("Décalage");
-                let mut off = ly.offset;
-                let r = ui
-                    .add(egui::DragValue::new(&mut off).range(-5.0..=5.0).speed(0.01).fixed_decimals(2).suffix(" s"))
-                    .on_hover_text("Positif : les paroles s'allument plus tôt ; négatif : plus tard.");
-                if r.changed() {
-                    ly.offset = off;
+            ui.spacing_mut().item_spacing.x = 14.0;
+            ui.scope(|ui| {
+                if !has_lyrics {
+                    ui.multiply_opacity(0.45);
                 }
-                if r.drag_stopped() || r.lost_focus() {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                th::switch(ui, &mut self.show_lyrics);
+                ui.label(th::t("Paroles à l'écran", 13.0, W::Bold, th::INK));
+            });
+            if let Some(ly) = &mut p.lyrics {
+                ui.label(th::t("Décalage", 13.0, W::Bold, th::MUTED))
+                    .on_hover_text("Positif : les paroles s'allument plus tôt ; négatif : plus tard.");
+                let label = format!(
+                    "{}{} s",
+                    if ly.offset > 0.0 { "+" } else if ly.offset < 0.0 { "−" } else { "" },
+                    format!("{:.2}", ly.offset.abs()).replace('.', ",")
+                );
+                if th::stepper(ui, &mut ly.offset, 0.05, -5.0..=5.0, &label) {
                     if let Some(dir) = p.path.parent() {
                         let _ = ly.save(&dir.join(pipeline::LYRICS_FILE));
                     }
                 }
-            } else {
-                ui.small("(pas de paroles pour ce morceau)");
             }
-            if ui.button("✏ Corriger les paroles…").clicked() {
-                open_editor = true;
-            }
-            ui.separator();
-            if has_video {
-                ui.add_enabled(
-                    has_lyrics && !exporting,
-                    egui::Checkbox::new(&mut burn_lyrics, "Incruster les paroles"),
-                );
-            }
-            do_export = ui
-                .add_enabled(!exporting, egui::Button::new(RichText::new("💾 Enregistrer…").strong()))
-                .on_hover_text("Enregistre le karaoké avec la tonalité et la vitesse actuelles")
-                .clicked();
-            do_reveal = ui.button("Afficher dans le dossier").clicked();
+            open_editor = th::secondary(ui, "Corriger les paroles…").clicked();
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                do_export = !exporting
+                    && th::primary_fit(ui, "Enregistrer…", 14.0, 38.0)
+                        .on_hover_text("Enregistre le karaoké avec la tonalité et la vitesse actuelles")
+                        .clicked();
+                if self.has_video {
+                    th::checkbox(ui, &mut self.burn_lyrics, "Incruster les paroles", has_lyrics);
+                }
+                if exporting {
+                    let frac = self.export_task.progress.unwrap_or(0.0);
+                    th::progress(ui, frac, 110.0, 6.0);
+                    ui.label(th::t("Encodage", 13.0, W::Bold, th::MUTED));
+                } else {
+                    match &self.export_result {
+                        Some(Ok(path)) => {
+                            if th::link(ui, "Afficher", th::ROSE).clicked() {
+                                let _ = media::reveal(path);
+                            }
+                            ui.label(th::t("Enregistré ·", 13.0, W::Bold, th::ROSE));
+                        }
+                        Some(Err(e)) => {
+                            ui.add(egui::Label::new(th::t(format!("Échec : {e}"), 12.0, W::Bold, Color32::from_rgb(0xa3, 0x2b, 0x48))).truncate());
+                        }
+                        None => {}
+                    }
+                }
+            });
         });
-        if do_reveal {
-            let _ = media::reveal(&p.path);
+
+        if open_editor {
+            self.lyrics_editor = Some(p.lyrics.as_ref().map(|l| l.to_text()).unwrap_or_default());
         }
-        self.show_lyrics = show_lyrics;
-        self.burn_lyrics = burn_lyrics;
         if do_export {
             self.start_export(ctx.clone());
         }
-
-        if open_editor {
-            self.lyrics_editor = Some(self.player.as_ref().and_then(|p| p.lyrics.as_ref()).map(|l| l.to_text()).unwrap_or_default());
-        }
-        self.lyrics_editor_window(&ctx);
-
-        if self.export_rx.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(&self.export_task.stage);
-            });
-            progress_bar(ui, self.export_task.progress);
-        }
-        match &self.export_result {
-            Some(Ok(path)) => {
-                let path = path.clone();
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(0x2e, 0xa0, 0x43), format!("Enregistré : {}", path.display()));
-                    if ui.small_button("Afficher").clicked() {
-                        let _ = media::reveal(&path);
-                    }
-                });
-            }
-            Some(Err(e)) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("Enregistrement impossible : {e}"));
-            }
-            None => {}
-        }
-
-        // Raccourcis clavier (si aucun champ de texte n'a le focus).
-        let typing = ctx.memory(|m| m.focused().is_some());
-        if !typing {
-            let (space, left, right, voice) = ctx.input(|i| {
-                (
-                    i.key_pressed(egui::Key::Space),
-                    i.key_pressed(egui::Key::ArrowLeft),
-                    i.key_pressed(egui::Key::ArrowRight),
-                    i.key_pressed(egui::Key::V),
-                )
-            });
-            if let Some(p) = &mut self.player {
-                if space {
-                    p.toggle();
-                }
-                if voice {
-                    p.set_original(!p.original());
-                }
-                if left {
-                    p.seek(p.position() - 5.0);
-                }
-                if right {
-                    p.seek(p.position() + 5.0);
-                }
-            }
-        }
-
         if self.player.as_ref().is_some_and(|p| p.is_playing()) {
             ctx.request_repaint();
         }
     }
-}
 
-impl App {
+    /// Raccourcis du lecteur (si aucun champ de texte n'a le focus).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.lyrics_editor.is_some() || ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let Some(p) = &mut self.player else { return };
+        let (space, left, right, voice) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::V),
+            )
+        });
+        if space {
+            p.toggle();
+        }
+        if voice {
+            p.set_original(!p.original());
+        }
+        if left {
+            p.seek(p.position() - 5.0);
+        }
+        if right {
+            p.seek(p.position() + 5.0);
+        }
+    }
+
     /// Fenêtre de correction des paroles : le texte corrigé est recalé sur la
     /// reconnaissance vocale (et sur le début des vers existants si leur nombre est inchangé).
     fn lyrics_editor_window(&mut self, ctx: &egui::Context) {
         let Some(text) = &mut self.lyrics_editor else { return };
-        let mut open = true;
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Window::new("Corriger les paroles")
-            .open(&mut open)
-            .default_size([520.0, 560.0])
-            .collapsible(false)
+        let (mut apply, mut cancel) = (false, false);
+        let logo = self.logo.clone();
+        let modal = egui::Modal::new(egui::Id::unique("corriger-paroles"))
+            .backdrop_color(Color32::from_rgba_unmultiplied(36, 28, 37, 97))
+            .frame(Frame::new().fill(th::PANEL).corner_radius(CornerRadius::same(22)).inner_margin(Margin::same(28)))
             .show(ctx, |ui| {
-                ui.label("Une ligne par vers. Corrigez les mots, ajoutez ou supprimez des lignes, ou collez les paroles exactes.");
-                ui.small("Les horodatages LRC « [mm:ss.xx] » en début de ligne sont acceptés.");
-                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(text).desired_rows(18).desired_width(f32::INFINITY));
-                });
+                ui.set_width(524.0);
+                ui.spacing_mut().item_spacing.y = 14.0;
                 ui.horizontal(|ui| {
-                    apply = ui.button(RichText::new("Appliquer").strong()).clicked();
-                    cancel = ui.button("Annuler").clicked();
+                    th::logo_disc(ui, &logo, 44.0, 40.0, th::ROSE_SOFT, 2.0);
+                    ui.label(th::t("Corriger les paroles", 28.0, W::Serif, th::INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                        ui.painter().circle_filled(r.center(), 16.0, th::SEGMENT_BG);
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, "×", th::font(18.0, W::Bold), if resp.hovered() { th::ROSE } else { th::MUTED });
+                        cancel |= resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                    });
+                });
+                ui.add(
+                    egui::Label::new(th::t(
+                        "Une ligne par vers. Corrigez les mots, ajoutez ou supprimez des lignes, ou collez les paroles exactes. Le texte sera recalé automatiquement.",
+                        14.0,
+                        W::Medium,
+                        th::MUTED,
+                    ))
+                    .wrap(),
+                );
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .font(th::font(15.0, W::Semi))
+                            .margin(Margin::symmetric(16, 14))
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.label(th::t("Les horodatages LRC « [mm:ss.xx] » en début de ligne sont acceptés.", 12.0, W::Medium, th::FAINT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    apply = th::primary_fit(ui, "Appliquer", 14.0, 40.0).clicked();
+                    cancel |= th::secondary_sized(ui, "Annuler", Vec2::new(100.0, 40.0), 12).clicked();
                 });
             });
+        if modal.should_close() {
+            cancel = true;
+        }
+
         if apply {
             if let (Some(p), Some(text)) = (&mut self.player, &self.lyrics_editor) {
                 let mut lines = karaoke::lyrics::parse_text(text);
@@ -709,48 +1047,146 @@ impl App {
                 }
                 let dir = p.path.parent().map(PathBuf::from).unwrap_or_default();
                 let (language, recognized) =
-                    karaoke::lyrics::read_whisper(&dir.join(karaoke::lyrics::WHISPER_JSON), &old.language)
-                        .unwrap_or_default();
+                    karaoke::lyrics::read_whisper(&dir.join(karaoke::lyrics::WHISPER_JSON), &old.language).unwrap_or_default();
                 let new = karaoke::lyrics::Lyrics {
                     language: if language.is_empty() { old.language } else { language },
                     lines: karaoke::align::align(&lines, &recognized, p.duration()),
                     offset: old.offset,
+                    source: "texte corrigé".into(),
                 };
                 let _ = new.save(&dir.join(pipeline::LYRICS_FILE));
                 p.lyrics = Some(new);
                 self.show_lyrics = true;
             }
         }
-        if apply || cancel || !open {
+        if apply || cancel {
             self.lyrics_editor = None;
         }
     }
-}
-
-fn progress_bar(ui: &mut egui::Ui, p: Option<f32>) {
-    let bar = match p {
-        Some(p) => egui::ProgressBar::new(p).show_percentage(),
-        None => egui::ProgressBar::new(0.0).animate(true),
-    };
-    ui.add(bar);
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         self.poll_export();
-        let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.is_file()).collect());
+        let ctx = ui.ctx().clone();
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.is_file()).collect());
         if let Some(path) = dropped.into_iter().next() {
             if !self.running() {
                 self.open_path(path);
             }
         }
 
-        egui::Panel::left("reglages")
-            .resizable(true)
+        egui::Panel::left("formulaire")
+            .show_separator_line(false)
+            .resizable(false)
             .default_size(360.0)
-            .min_size(300.0)
+            .min_size(360.0)
+            .frame(Frame::new().fill(th::PANEL).stroke(Stroke::new(1.0, th::BORDER)))
             .show(ui, |ui| self.side_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.player_ui(ui));
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(th::BG).inner_margin(Margin::same(28)))
+            .show(ui, |ui| {
+                self.banners(ui);
+                if self.running() {
+                    self.processing(ui);
+                } else if self.player.is_some() {
+                    self.player_ui(ui);
+                } else {
+                    self.welcome(ui);
+                }
+            });
+
+        self.lyrics_editor_window(&ctx);
+        self.shortcuts(&ctx);
     }
+}
+
+// ───────────────────────────── Petits éléments ─────────────────────────────
+
+fn fmt(size: f32, w: W, color: Color32) -> TextFormat {
+    TextFormat { font_id: th::font(size, w), color, ..Default::default() }
+}
+
+fn fmt_time(t: f64) -> String {
+    let s = t.max(0.0) as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Libellé dépliable précédé d'un chevron « › ».
+fn disclosure(ui: &mut egui::Ui, label: &str, open: bool, size: f32, w: W, color: Color32) -> egui::Response {
+    let text = if open { format!("⌄  {label}") } else { format!("›  {label}") };
+    let mut rt = th::t(text, size, w, color);
+    if size <= 11.0 {
+        rt = rt.extra_letter_spacing(1.3);
+    }
+    ui.add(egui::Label::new(rt).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Rangée centrée horizontalement (largeur approximative du contenu).
+fn centered_row(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+        add(ui);
+    });
+}
+
+/// Carte de réglage du lecteur (libellé, valeur, curseur). Renvoie la nouvelle valeur.
+#[allow(clippy::too_many_arguments)]
+fn knob(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    value_label: &str,
+    value: f64,
+    range: std::ops::RangeInclusive<f64>,
+    step: f64,
+    origin: f64,
+) -> Option<f64> {
+    let mut out = None;
+    th::card(16, Margin::symmetric(16, 12)).show(ui, |ui| {
+        let inner = width - 32.0;
+        ui.set_width(inner);
+        ui.spacing_mut().item_spacing.y = 10.0;
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(th::t(label, 13.0, W::Bold, th::MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(th::t(value_label, 15.0, W::Black, th::INK));
+                });
+            });
+            let mut v = value;
+            if th::slider(ui, &mut v, range, step, origin, inner).changed() {
+                out = Some(v);
+            }
+        });
+    });
+    out
+}
+
+/// Pastille dessinée sur l'image.
+fn pill(painter: &egui::Painter, anchor: Pos2, align: Align2, text: &str, bg: Color32, fg: Color32, caps: bool) {
+    let f = th::font(12.0, if caps { W::Black } else { W::Bold });
+    let galley = painter.layout_no_wrap(text.to_string(), f, fg);
+    let size = galley.size() + Vec2::new(28.0, 18.0);
+    let rect = align.anchor_size(anchor, size);
+    painter.rect_filled(rect, CornerRadius::same(255), bg);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+}
+
+/// Bandeau d'information refermable.
+fn banner(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32, close: &mut bool) {
+    Frame::new().fill(bg).corner_radius(CornerRadius::same(12)).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.set_width(ui.available_width());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if th::link(ui, "×", fg).clicked() {
+                    *close = true;
+                }
+                ui.add(egui::Label::new(th::t(text, 13.0, W::Semi, fg)).wrap());
+            });
+        });
+    });
+    ui.add_space(8.0);
 }
