@@ -32,6 +32,13 @@ Tout est enregistré dans **`Documents\MagicMus`** :
 Les outils et modèles d'IA (≈ 1 Go) restent dans `%LOCALAPPDATA%\Karaoke` : ils font partie de l'application, et
 Documents est souvent synchronisé avec OneDrive.
 
+## Mises à jour
+
+Au démarrage, MagicMus vérifie s'il existe une version plus récente sur
+[GitHub](https://github.com/Elyss/magicmus/releases). Si c'est le cas, un bandeau propose de la télécharger :
+l'application vérifie l'empreinte du fichier, se remplace elle-même, puis il suffit de cliquer sur « Redémarrer ».
+Les chansons et réglages sont conservés.
+
 ## Design
 
 Interface d'après la maquette « MagicMus design modern » (Claude Design) : tons crème et rose, boutons noir prune,
@@ -39,8 +46,9 @@ titres en DM Serif Display, texte en Nunito (polices OFL, `assets/fonts`), logo 
 Couleurs et composants dessinés à la main dans `src/theme.rs`. Dans les options : couleur des mots chantés (rose, or,
 crème, lavande) et taille des paroles.
 
-**Aucune installation n'est nécessaire.** Au premier usage, l'application télécharge elle-même ce dont elle a besoin
-dans `%LOCALAPPDATA%\Karaoke` (environ 300 Mo, une seule fois) :
+**Aucune installation n'est nécessaire** : `MagicMus.exe` se partage seul (Windows 10 ou 11, 64 bits). Au premier
+usage, l'application télécharge elle-même ce dont elle a besoin dans `%LOCALAPPDATA%\Karaoke` (environ 1,5 Go
+avec les modèles, une seule fois) :
 
 | Élément | Rôle |
 |---|---|
@@ -48,6 +56,7 @@ dans `%LOCALAPPDATA%\Karaoke` (environ 300 Mo, une seule fois) :
 | ffmpeg / ffprobe / ffplay | décodage, encodage et lecture |
 | ONNX Runtime (Microsoft) | moteur d'exécution du réseau de neurones |
 | Modèle UVR-MDX-NET Inst HQ 3 | réseau de neurones de séparation voix / musique |
+| Microsoft Visual C++ 2015-2022 (seulement s'il manque) | bibliothèque Windows requise par ONNX Runtime et Whisper : installateur officiel, signature vérifiée ; Windows demande une fois l'autorisation |
 | Modèle MMS-300M (≈ 630 Mo, au premier recalage des paroles) | alignement de chaque mot sur la voix |
 
 Si un outil est déjà installé sur la machine (dans le PATH), il est utilisé tel quel. Si une vidéo ne se télécharge
@@ -89,8 +98,9 @@ Le karaoké se lit dans la fenêtre :
   première fois, le temps d'analyser la voix, puis quelques secondes grâce à `emissions.bin`).
 - **Tonalité** (−12 à +12 demi-tons) et **vitesse** (50 à 150 %) se règlent pendant la lecture, sans que l'une modifie
   l'autre (Signalsmith Stretch, intégré dans `vendor/signalsmith`).
-- **Enregistrer…** : crée un fichier avec la tonalité et la vitesse actuelles, et les paroles karaoké incrustées dans la
-  vidéo si la case est cochée.
+- **Enregistrer…** : un menu propose la **vidéo (MP4)**, avec les paroles karaoké incrustées si la case
+  « Incruster » est cochée, ou l'**audio seul** (MP3, ou WAV sans perte). Dans tous les cas, la tonalité et la
+  vitesse actuelles sont appliquées (rappelées en tête du menu).
 
 Un karaoké déjà créé se rouvre avec « Ouvrir un karaoké déjà créé… », par glisser-déposer sur la fenêtre ou en
 passant le fichier en argument à `Karaoke.exe`.

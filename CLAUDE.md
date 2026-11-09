@@ -36,6 +36,21 @@ cargo run --release --example diag_paroles -- "<dossier de la chanson>" [--resum
 Le build de débogage (`cargo build` sans `--release`) plante au démarrage (erreur de segmentation, cause non
 identifiée, aussi sans le mode démo) : tester avec `--release`.
 
+## Publier une version (mises à jour automatiques)
+
+Au démarrage, l'application interroge `api.github.com/repos/Elyss/magicmus/releases/latest` (`src/update.rs`) ; si
+l'étiquette `vX.Y.Z` dépasse la version de `Cargo.toml`, un bandeau propose « Mettre à jour » : téléchargement de
+l'asset `MagicMus.exe`, vérification SHA-256 (champ `digest` de GitHub, sinon asset `MagicMus.exe.sha256` ; sans
+empreinte, refus), renommage de l'exe en cours en `MagicMus.avant-maj.exe` (supprimé au démarrage suivant), puis
+« Redémarrer ». `MAGICMUS_NO_UPDATE` désactive la recherche ; `MAGICMUS_UPDATE_API` pointe vers une autre adresse
+(tests avec un serveur local, `tests/update.rs`).
+
+1. Augmenter `version` dans `Cargo.toml`.
+2. `powershell -ExecutionPolicy Bypass -File scripts\preparer-version.ps1` (compile, teste, copie
+   `dist\MagicMus.exe` et écrit `dist\MagicMus.exe.sha256`).
+3. Commit, `git tag vX.Y.Z`, push de la branche et de l'étiquette (l'utilisateur pousse lui-même).
+4. Release GitHub `vX.Y.Z` avec les deux fichiers de `dist\` (interface web, ou `gh release create`).
+
 ## Architecture
 
 | Fichier | Rôle |
@@ -56,6 +71,7 @@ identifiée, aussi sans le mode démo) : tester avec `--release`.
 | `src/vocal.rs` | attaques de la voix isolée (`attaques.json`) |
 | `src/player.rs` | lecteur : cpal + Signalsmith (tonalité/vitesse), frames vidéo ffmpeg, rendu des paroles, bascule voix originale |
 | `src/export.rs` | rendu final : tonalité/vitesse, `setpts`, paroles incrustées (`ass`) |
+| `src/update.rs` | mises à jour : dernière Release GitHub, téléchargement vérifié, remplacement de l'exe |
 | `src/tools.rs` | lancement des outils sans console, PATH, lecture de progression |
 
 Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `karaoke_rapide.mp4`, `whisper.json`
@@ -65,6 +81,12 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
 
 - **Aucune installation pour l'utilisateur** : tout outil manquant est téléchargé au premier usage ; ne pas ajouter de
   dépendance système (Python, etc.).
+- **CRT Visual C++ lié statiquement** (`.cargo/config.toml`, `+crt-static`, d'où Signalsmith en /MT) : l'exe démarre
+  sans « Visual C++ Redistributable ». ONNX Runtime et whisper.cpp en ont besoin : `setup::ensure_vc_runtime`
+  (registre `VC\Runtimesd`, minimum 14.40, sinon ONNX Runtime 1.31 plante) télécharge `vc_redist.x64.exe`
+  (aka.ms), vérifie la signature Microsoft et le lance via `Start-Process -Verb RunAs` (une demande UAC). Pas de
+  DLL embarquées : celles des Build Tools 2019 installés ici sont en 14.27, trop anciennes. ffmpeg (MinGW), yt-dlp
+  et Deno n'en ont pas besoin.
 - ONNX Runtime en `load-dynamic` : la version statique pour Windows inclut DirectML et exige `DXCORE.lib`, absent du
   SDK Windows 10.0.18362 installé.
 - Paroles : texte saisi > LRCLIB > reconnaissance Whisper seule. Construction dans `pipeline::build_lyrics`

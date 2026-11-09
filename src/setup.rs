@@ -83,8 +83,90 @@ pub fn ensure_tools(need_ytdlp: bool, progress: &mut dyn FnMut(&str, Option<f32>
     Ok(())
 }
 
+/// Installateur officiel de la bibliothèque Microsoft Visual C++ 2015-2022 (x64),
+/// requise par ONNX Runtime et whisper.cpp (MagicMus.exe, lui, l'intègre : voir
+/// `.cargo/config.toml`).
+const VC_REDIST_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+/// Version minimale : ONNX Runtime 1.31 est compilé avec Visual Studio 2022 17.10+,
+/// qui plante avec une bibliothèque antérieure à 14.40.
+const VC_MIN_MINOR: u32 = 40;
+
+/// Version installée (majeure, mineure) de la bibliothèque Visual C++ x64, d'après le
+/// registre (`None` si absente).
+pub fn vc_runtime_version() -> Option<(u32, u32)> {
+    let out = crate::tools::command("reg")
+        .args(["query", r"HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let dword = |name: &str| {
+        text.lines().find_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next() == Some(name) && it.next() == Some("REG_DWORD"))
+                .then(|| it.next().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+                .flatten()
+        })
+    };
+    (dword("Installed") == Some(1)).then_some(())?;
+    Some((dword("Major")?, dword("Minor")?))
+}
+
+/// Installe la bibliothèque Visual C++ si elle manque ou est trop ancienne : installateur
+/// officiel Microsoft, signature vérifiée, lancé avec la demande d'autorisation de
+/// Windows (une seule fois, sans autre intervention).
+pub fn ensure_vc_runtime(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<()> {
+    if vc_runtime_version().is_some_and(|(major, minor)| major > 14 || (major == 14 && minor >= VC_MIN_MINOR)) {
+        return Ok(());
+    }
+    fs::create_dir_all(app_dir())?;
+    let exe = app_dir().join("vc_redist.x64.exe");
+    download(VC_REDIST_URL, &exe, "composant Windows « Visual C++ » (≈ 25 Mo, une seule fois)", progress)?;
+    check_microsoft_signature(&exe)?;
+    progress("Installation du composant Windows « Visual C++ » : acceptez la demande de Windows", None);
+    // L'installateur exige les droits d'administrateur : lancement via ShellExecute
+    // (« runas »), qui affiche la demande d'autorisation de Windows.
+    let script = format!(
+        "$p = Start-Process -FilePath '{}' -ArgumentList '/install','/passive','/norestart' -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+        exe.display().to_string().replace('\'', "''")
+    );
+    let status = crate::tools::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .status()
+        .context("lancement de l'installateur Visual C++")?;
+    let _ = fs::remove_file(&exe);
+    // 0 : installé ; 3010 : installé, redémarrage conseillé ; 1638 : version plus récente déjà là.
+    let code = status.code().unwrap_or(-1);
+    if ![0, 3010, 1638].contains(&code) && vc_runtime_version().is_none() {
+        bail!(
+            "le composant Windows « Visual C++ » n'a pas pu être installé (code {code}). Installez \
+             « Microsoft Visual C++ Redistributable x64 » depuis le site de Microsoft, puis relancez."
+        );
+    }
+    Ok(())
+}
+
+/// Vérifie que l'exécutable téléchargé est signé par Microsoft (signature Authenticode valide).
+fn check_microsoft_signature(path: &Path) -> Result<()> {
+    let script = format!(
+        "$s = Get-AuthenticodeSignature -LiteralPath '{}'; $s.Status.ToString() + '|' + $s.SignerCertificate.Subject",
+        path.display().to_string().replace('\'', "''")
+    );
+    let out = crate::tools::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("vérification de la signature")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (status, subject) = text.trim().split_once('|').unwrap_or(("", ""));
+    if status != "Valid" || !subject.contains("O=Microsoft Corporation") {
+        let _ = fs::remove_file(path);
+        bail!("l'installateur Visual C++ téléchargé n'est pas signé par Microsoft ({status})");
+    }
+    Ok(())
+}
+
 /// Chemin de `onnxruntime.dll` (à côté de l'exe, sinon téléchargé au premier usage).
 pub fn ensure_onnxruntime(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<PathBuf> {
+    ensure_vc_runtime(progress)?;
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     if let Some(dir) = exe_dir {
         for p in [dir.join(ORT_DLL), dir.join("tools").join(ORT_DLL)] {
@@ -129,6 +211,7 @@ const VAD_MODEL: &str = "ggml-silero-v5.1.2.bin";
 const VAD_MODEL_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
 
 pub fn ensure_whisper(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<Whisper> {
+    ensure_vc_runtime(progress)?;
     let dir = tools_dir().join("whisper");
     let cli = dir.join("whisper-cli.exe");
     if !cli.is_file() {
@@ -182,7 +265,7 @@ pub fn ensure_aligner(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<Pat
     Ok(path)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut f = File::open(path)?;
     let mut h = Sha256::new();
@@ -222,7 +305,7 @@ pub fn ensure_model(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<PathB
 
 /// Télécharge `url` vers `dest` (via un fichier temporaire, pour ne jamais laisser
 /// un fichier incomplet).
-fn download(url: &str, dest: &Path, label: &str, progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<()> {
+pub(crate) fn download(url: &str, dest: &Path, label: &str, progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<()> {
     let msg = format!("Téléchargement de {label}");
     progress(&msg, Some(0.0));
     let resp = ureq::get(url)

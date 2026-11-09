@@ -15,6 +15,7 @@ use eframe::egui::{
     TextFormat, TextureHandle, Vec2,
 };
 use karaoke::export::{self, ExportSettings};
+use karaoke::update;
 use karaoke::pipeline::{self, Event, Method, Options, Outcome};
 use karaoke::player::{self, LyricsStyle, Player};
 use karaoke::{media, tools};
@@ -171,6 +172,48 @@ enum ResyncMsg {
     Done(Option<karaoke::lyrics::Lyrics>, Vec<String>),
 }
 
+/// Mise à jour de l'application (voir `karaoke::update`).
+enum UpdateState {
+    /// Recherche en cours, rien à proposer, ou proposition écartée.
+    Idle,
+    Available(update::Release),
+    Downloading(String, Option<f32>),
+    /// Nouvelle version en place : il reste à relancer.
+    Ready(PathBuf, String),
+    Failed(String),
+}
+
+enum UpdateMsg {
+    Found(Option<update::Release>),
+    Progress(String, Option<f32>),
+    Installed(Result<(PathBuf, String), String>),
+}
+
+/// Format choisi dans le menu « Enregistrer… ».
+#[derive(Clone, Copy, PartialEq)]
+enum ExportKind {
+    Video,
+    Mp3,
+    Wav,
+}
+
+impl ExportKind {
+    fn ext(self) -> &'static str {
+        match self {
+            ExportKind::Video => "mp4",
+            ExportKind::Mp3 => "mp3",
+            ExportKind::Wav => "wav",
+        }
+    }
+    fn filter(self) -> &'static str {
+        match self {
+            ExportKind::Video => "Vidéo MP4",
+            ExportKind::Mp3 => "Audio MP3",
+            ExportKind::Wav => "Audio WAV",
+        }
+    }
+}
+
 enum ExportMsg {
     Progress(String, Option<f32>),
     Done(Result<PathBuf, String>),
@@ -219,6 +262,11 @@ struct App {
     resync_status: Option<(String, Option<f32>)>,
     resync_msg: Option<(String, bool, std::time::Instant)>,
 
+    // Mise à jour de l'application
+    update: UpdateState,
+    update_rx: Option<Receiver<UpdateMsg>>,
+    update_started: bool,
+
     // Bibliothèque, historique et réglages (Documents\MagicMus)
     store: Store,
     settings: Settings,
@@ -264,6 +312,9 @@ impl App {
             resync_rx: None,
             resync_status: None,
             resync_msg: None,
+            update: UpdateState::Idle,
+            update_rx: None,
+            update_started: false,
             store,
             settings: settings.clone(),
             lib_ui: LibUi::default(),
@@ -441,11 +492,11 @@ impl App {
 
     // ──────────────────────────── Enregistrement ────────────────────────────
 
-    fn start_export(&mut self, ctx: egui::Context) {
+    fn start_export(&mut self, ctx: egui::Context, kind: ExportKind) {
         let Some(p) = &self.player else { return };
         let (tempo, semitones) = (p.tempo(), p.semitones());
         let has_video = self.has_video;
-        let ext = if has_video { "mp4" } else { "m4a" };
+        let ext = kind.ext();
         let mut name = format!("{} - karaoké", p.title);
         if semitones != 0.0 {
             name.push_str(&format!(" {semitones:+} ton"));
@@ -454,16 +505,17 @@ impl App {
             name.push_str(&format!(" {}%", (tempo * 100.0).round()));
         }
         let name: String = name.chars().filter(|c| !r#"\/:*?"<>|"#.contains(*c)).collect();
-        let mut dialog = rfd::FileDialog::new().set_file_name(format!("{name}.{ext}"));
-        dialog = if has_video {
-            dialog.add_filter("Vidéo MP4", &["mp4"]).add_filter("Audio seul", &["m4a", "mp3", "wav"])
-        } else {
-            dialog.add_filter("Audio", &["m4a", "mp3", "wav"])
-        };
+        let mut dialog = rfd::FileDialog::new().set_file_name(format!("{name}.{ext}")).add_filter(kind.filter(), &[ext]);
         if let Some(dir) = p.path.parent() {
             dialog = dialog.set_directory(dir);
         }
-        let Some(dest) = dialog.save_file() else { return };
+        let Some(mut dest) = dialog.save_file() else { return };
+        // Le format choisi dans le menu prime sur l'extension tapée.
+        if dest.extension().and_then(|e| e.to_str()).is_none_or(|e| !e.eq_ignore_ascii_case(ext)) {
+            let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            name.push(format!(".{ext}"));
+            dest.set_file_name(name);
+        }
 
         let source = p.path.clone();
         let lyrics = p.lyrics.clone();
@@ -484,6 +536,128 @@ impl App {
             let _ = tx.send(ExportMsg::Done(res));
             ctx.request_repaint();
         });
+    }
+
+    // ──────────────────────────── Mise à jour ────────────────────────────
+
+    /// Recherche (au premier affichage) puis suivi de la mise à jour.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        if !self.update_started {
+            self.update_started = true;
+            update::cleanup();
+            let (tx, rx) = mpsc::channel();
+            self.update_rx = Some(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                // Pas de connexion, GitHub indisponible… : rien à proposer.
+                let _ = tx.send(UpdateMsg::Found(update::check().ok().flatten()));
+                ctx.request_repaint();
+            });
+        }
+        let Some(rx) = &self.update_rx else { return };
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                UpdateMsg::Found(Some(r)) => self.update = UpdateState::Available(r),
+                UpdateMsg::Found(None) => {}
+                UpdateMsg::Progress(s, p) => self.update = UpdateState::Downloading(s, p),
+                UpdateMsg::Installed(Ok((exe, v))) => self.update = UpdateState::Ready(exe, v),
+                UpdateMsg::Installed(Err(e)) => self.update = UpdateState::Failed(e),
+            }
+        }
+    }
+
+    fn start_update(&mut self, ctx: egui::Context, rel: update::Release) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update = UpdateState::Downloading("Téléchargement".into(), Some(0.0));
+        std::thread::spawn(move || {
+            let mut progress = |s: &str, p: Option<f32>| {
+                let _ = tx.send(UpdateMsg::Progress(s.to_string(), p));
+                ctx.request_repaint();
+            };
+            let res = update::install(&rel, &mut progress).map(|exe| (exe, rel.version.clone())).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UpdateMsg::Installed(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Bandeau de mise à jour (même présentation que celui des anciens karaokés).
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        if matches!(self.update, UpdateState::Idle) {
+            return;
+        }
+        let busy = self.running() || self.export_rx.is_some() || self.resync_rx.is_some();
+        let (mut go, mut later, mut restart, mut notes) = (false, false, false, false);
+        th::card(14, egui::Margin::symmetric(16, 12)).fill(th::ROSE_CARD).stroke(Stroke::new(1.0, th::ROSE_LIGHT)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width((ui.available_width() - 330.0).max(200.0));
+                    let (title, detail) = match &self.update {
+                        UpdateState::Available(r) => (
+                            format!("MagicMus {} est disponible", r.version),
+                            format!("Vous avez la version {}. Vos chansons et réglages sont conservés.", update::current_version()),
+                        ),
+                        UpdateState::Downloading(s, _) => ("Mise à jour en cours".into(), s.clone()),
+                        UpdateState::Ready(_, v) => (
+                            format!("MagicMus {v} est installé"),
+                            "Redémarrez l'application pour utiliser la nouvelle version.".into(),
+                        ),
+                        UpdateState::Failed(e) => ("La mise à jour a échoué".into(), e.clone()),
+                        UpdateState::Idle => unreachable!(),
+                    };
+                    ui.label(th::t(title, 14.0, W::Bold, th::INK));
+                    ui.add(egui::Label::new(th::t(detail, 12.0, W::Medium, th::MUTED)).truncate());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.update {
+                    UpdateState::Available(_) => {
+                        later = th::secondary(ui, "Plus tard").on_hover_text("Proposer de nouveau au prochain démarrage").clicked();
+                        go = th::primary_fit(ui, "Mettre à jour", 13.0, 34.0)
+                            .on_hover_text("Télécharge la nouvelle version et remplace l'application")
+                            .clicked();
+                        notes = th::link(ui, "Nouveautés", th::ROSE).clicked();
+                    }
+                    UpdateState::Downloading(_, p) => {
+                        th::progress(ui, p.unwrap_or(0.0), 160.0, 6.0);
+                    }
+                    UpdateState::Ready(..) => {
+                        later = th::secondary(ui, "Plus tard").on_hover_text("La nouvelle version démarrera la prochaine fois").clicked();
+                        if busy {
+                            ui.label(th::t("Après le traitement en cours", 12.0, W::Bold, th::MUTED));
+                        } else {
+                            restart = th::primary_fit(ui, "Redémarrer", 13.0, 34.0).clicked();
+                        }
+                    }
+                    UpdateState::Failed(_) => {
+                        later = th::secondary(ui, "Fermer").clicked();
+                    }
+                    UpdateState::Idle => {}
+                });
+            });
+        });
+        ui.add_space(10.0);
+        if notes {
+            if let UpdateState::Available(r) = &self.update {
+                let _ = std::process::Command::new("explorer").arg(&r.page).spawn();
+            }
+        }
+        if go {
+            if let UpdateState::Available(r) = &self.update {
+                let r = r.clone();
+                self.start_update(ui.ctx().clone(), r);
+            }
+        }
+        if restart {
+            if let UpdateState::Ready(exe, _) = &self.update {
+                match update::relaunch(exe) {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.update = UpdateState::Failed(format!("{e:#}")),
+                }
+            }
+        }
+        if later {
+            self.update = UpdateState::Idle;
+        }
     }
 
     // ──────────────────────────── Resynchronisation ────────────────────────────
@@ -1141,7 +1315,8 @@ impl App {
 
         // Paroles et enregistrement
         let has_lyrics = p.lyrics.is_some();
-        let (mut open_editor, mut do_export, mut do_resync) = (false, false, false);
+        let (mut open_editor, mut do_resync) = (false, false);
+        let mut do_export: Option<ExportKind> = None;
         let exporting = self.export_rx.is_some();
         let resyncing = self.resync_rx.is_some();
         ui.horizontal(|ui| {
@@ -1197,10 +1372,54 @@ impl App {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
-                do_export = !exporting
-                    && th::primary_fit(ui, "Enregistrer…", 14.0, 38.0)
-                        .on_hover_text("Enregistre le karaoké avec la tonalité et la vitesse actuelles")
-                        .clicked();
+                if !exporting {
+                    let r = th::primary_fit(ui, "Enregistrer…", 14.0, 38.0)
+                        .on_hover_text("Enregistre le karaoké avec la tonalité et la vitesse actuelles");
+                    // Réglages appliqués, rappelés en tête du menu.
+                    let mut applied = Vec::new();
+                    if p.semitones() != 0.0 {
+                        applied.push(format!("tonalité {:+}", p.semitones()));
+                    }
+                    if (p.tempo() - 1.0).abs() > 1e-3 {
+                        applied.push(format!("vitesse {:.0} %", p.tempo() * 100.0));
+                    }
+                    let note = if applied.is_empty() {
+                        "Tonalité et vitesse d'origine".to_string()
+                    } else {
+                        format!("Avec {}", applied.join(" et "))
+                    };
+                    let burn = self.burn_lyrics && has_lyrics;
+                    let has_video = self.has_video;
+                    egui::Popup::menu(&r).show(|ui| {
+                        ui.set_min_width(250.0);
+                        ui.label(th::t(note, 12.0, W::Bold, th::FAINT));
+                        ui.add_space(2.0);
+                        if has_video {
+                            let label = if burn { "Vidéo (MP4) · paroles incrustées" } else { "Vidéo (MP4)" };
+                            if ui
+                                .button(th::t(label, 13.0, W::Bold, th::INK))
+                                .on_hover_text("Image et son ; case « Incruster » pour les paroles")
+                                .clicked()
+                            {
+                                do_export = Some(ExportKind::Video);
+                            }
+                        }
+                        if ui
+                            .button(th::t("Audio seul (MP3)", 13.0, W::Bold, th::INK))
+                            .on_hover_text("Fichier léger, lisible partout")
+                            .clicked()
+                        {
+                            do_export = Some(ExportKind::Mp3);
+                        }
+                        if ui
+                            .button(th::t("Audio seul (WAV, sans perte)", 13.0, W::Bold, th::INK))
+                            .on_hover_text("Qualité maximale, fichier volumineux")
+                            .clicked()
+                        {
+                            do_export = Some(ExportKind::Wav);
+                        }
+                    });
+                }
                 if self.has_video {
                     th::checkbox(ui, &mut self.burn_lyrics, "Incruster", has_lyrics)
                         .on_hover_text("Incruster les paroles dans la vidéo enregistrée");
@@ -1229,8 +1448,8 @@ impl App {
         if open_editor {
             self.lyrics_editor = Some(p.lyrics.as_ref().map(|l| l.to_text()).unwrap_or_default());
         }
-        if do_export {
-            self.start_export(ctx.clone());
+        if let Some(kind) = do_export {
+            self.start_export(ctx.clone(), kind);
         }
         if do_resync {
             self.start_resync(ctx.clone(), None);
@@ -1338,6 +1557,7 @@ impl eframe::App for App {
         self.poll_export();
         self.poll_resync();
         let ctx = ui.ctx().clone();
+        self.poll_update(&ctx);
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.is_file()).collect());
         if let Some(path) = dropped.into_iter().next() {
@@ -1356,6 +1576,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(th::BG).inner_margin(Margin::same(28)))
             .show(ui, |ui| {
+                self.update_banner(ui);
                 self.migration_banner(ui);
                 self.banners(ui);
                 if self.running() {

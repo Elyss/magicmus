@@ -1,0 +1,5 @@
+# Bibliothèque C/C++ de Microsoft (CRT) liée dans l'exe : MagicMus démarre sur un PC
+# sans « Visual C++ Redistributable » (sinon : « VCRUNTIME140.dll introuvable »).
+# Le crate cc compile alors aussi Signalsmith Stretch en /MT.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
