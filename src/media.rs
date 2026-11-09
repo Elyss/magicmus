@@ -150,6 +150,20 @@ pub fn write_wav_16k_mono(pcm: &[f32], sample_rate: u32, wav: &Path) -> Result<(
     feed_ffmpeg(cmd, pcm, &mut |_| {}).context("création du WAV pour la reconnaissance des paroles")
 }
 
+/// Convertit du PCM stéréo entrelacé en mono 16 kHz (rééchantillonnage ffmpeg).
+pub fn to_mono_16k(pcm: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
+    let tmp = std::env::temp_dir().join(format!("magicmus-16k-{}-{}.raw", std::process::id(), crate::library::now()));
+    let mut cmd = tools::command("ffmpeg");
+    cmd.args(["-v", "error", "-y", "-f", "f32le", "-ar", &sample_rate.to_string(), "-ac", "2", "-i", "pipe:0"])
+        .args(["-ac", "1", "-ar", "16000", "-f", "f32le"])
+        .arg(&tmp);
+    let res = feed_ffmpeg(cmd, pcm, &mut |_| {}).context("conversion en 16 kHz mono");
+    let bytes = std::fs::read(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    res?;
+    Ok(bytes?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+}
+
 /// Durée du fichier en secondes.
 pub fn duration(path: &Path) -> Option<f64> {
     let out = tools::command("ffprobe")

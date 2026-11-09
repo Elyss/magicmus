@@ -166,6 +166,11 @@ enum Msg {
     Finished(Result<Outcome, String>),
 }
 
+enum ResyncMsg {
+    Progress(String, Option<f32>),
+    Done(Option<karaoke::lyrics::Lyrics>, Vec<String>),
+}
+
 enum ExportMsg {
     Progress(String, Option<f32>),
     Done(Result<PathBuf, String>),
@@ -209,7 +214,9 @@ struct App {
     export_task: Task,
     export_result: Option<Result<PathBuf, String>>,
     /// Resynchronisation des paroles en cours, et son dernier résultat (message, réussite, instant).
-    resync_rx: Option<Receiver<(Option<karaoke::lyrics::Lyrics>, Vec<String>)>>,
+    resync_rx: Option<Receiver<ResyncMsg>>,
+    /// Étape et progression de la resynchronisation en cours.
+    resync_status: Option<(String, Option<f32>)>,
     resync_msg: Option<(String, bool, std::time::Instant)>,
 
     // Bibliothèque, historique et réglages (Documents\MagicMus)
@@ -255,6 +262,7 @@ impl App {
             export_task: Task::default(),
             export_result: None,
             resync_rx: None,
+            resync_status: None,
             resync_msg: None,
             store,
             settings: settings.clone(),
@@ -308,7 +316,7 @@ impl App {
                 if let Some(p) = &self.player {
                     p.pause();
                 }
-                self.start_resync(ctx.clone());
+                self.start_resync(ctx.clone(), None);
             }
             _ => {}
         }
@@ -482,22 +490,29 @@ impl App {
 
     /// Reconstruit les paroles du morceau ouvert (sans relancer Whisper) : paroles
     /// exactes en ligne, ou texte saisi / corrigé, recalées sur la voix entendue.
-    fn start_resync(&mut self, ctx: egui::Context) {
+    /// `text` : texte corrigé à aligner (fenêtre « Corriger »), sinon texte conservé.
+    fn start_resync(&mut self, ctx: egui::Context, text: Option<String>) {
         let Some(p) = &self.player else { return };
         let Some(dir) = p.path.parent().map(PathBuf::from) else { return };
         let old = p.lyrics.clone();
         // Un texte fourni ou corrigé par l'utilisateur est conservé.
-        let user_text = old
-            .as_ref()
-            .filter(|l| l.source == "texte saisi" || l.source == "texte corrigé")
-            .map(|l| l.to_text());
+        let user_text = text.or_else(|| {
+            old.as_ref()
+                .filter(|l| l.source == "texte saisi" || l.source == "texte corrigé")
+                .map(|l| l.to_text())
+        });
+        let offset = old.as_ref().map_or(0.0, |l| l.offset);
         let language = old.as_ref().map(|l| l.language.clone()).filter(|l| !l.is_empty()).unwrap_or_else(|| "auto".into());
-        let (title, duration) = (p.title.clone(), p.duration());
+        let (title, duration, karaoke_path) = (p.title.clone(), p.duration(), p.path.clone());
         let (tx, rx) = mpsc::channel();
         self.resync_rx = Some(rx);
         self.resync_msg = None;
+        self.resync_status = None;
         std::thread::spawn(move || {
             let mut warnings = Vec::new();
+            let progress_tx = tx.clone();
+            let progress_ctx = ctx.clone();
+            let mut stage = String::new();
             let req = pipeline::LyricsRequest {
                 work_dir: &dir,
                 title: &title,
@@ -507,26 +522,52 @@ impl App {
                 language: &language,
                 user_text: user_text.as_deref(),
                 online: true,
+                karaoke: Some(&karaoke_path),
             };
-            let mut ly = pipeline::build_lyrics(&req, &mut |e| {
-                if let Event::Warning(w) = e {
-                    warnings.push(w);
+            let mut ly = pipeline::build_lyrics(&req, &mut |e| match e {
+                Event::Warning(w) => warnings.push(w),
+                Event::Stage(s) => {
+                    stage = s;
+                    let _ = progress_tx.send(ResyncMsg::Progress(stage.clone(), None));
+                    progress_ctx.request_repaint();
                 }
+                Event::Progress(p) => {
+                    let _ = progress_tx.send(ResyncMsg::Progress(stage.clone(), Some(p)));
+                    progress_ctx.request_repaint();
+                }
+                Event::Log(_) => {}
             });
-            if let (Some(ly), Some(src)) = (&mut ly, user_text.as_ref().and(Some("texte corrigé"))) {
-                ly.source = src.into();
+            if let (Some(ly), Some(_)) = (&mut ly, user_text.as_ref()) {
+                ly.source = "texte corrigé".into();
             }
-            if let Some(ly) = &ly {
+            if let Some(ly) = &mut ly {
+                ly.offset = offset;
                 let _ = ly.save(&dir.join(pipeline::LYRICS_FILE));
             }
-            let _ = tx.send((ly, warnings));
+            let _ = tx.send(ResyncMsg::Done(ly, warnings));
             ctx.request_repaint();
         });
     }
 
     fn poll_resync(&mut self) {
         let Some(rx) = &self.resync_rx else { return };
-        let msg = match rx.try_recv() {
+        let mut done = None;
+        loop {
+            match rx.try_recv() {
+                Ok(ResyncMsg::Progress(s, p)) => self.resync_status = Some((s, p)),
+                Ok(ResyncMsg::Done(ly, w)) => {
+                    done = Some(Ok((ly, w)));
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    done = Some(Err(()));
+                    break;
+                }
+            }
+        }
+        let Some(done) = done else { return };
+        let msg = match done {
             Ok((Some(ly), _)) => {
                 let n = ly.lines.len();
                 if let Some(p) = &mut self.player {
@@ -536,9 +577,9 @@ impl App {
                 (format!("Paroles resynchronisées ({n} lignes)"), true)
             }
             Ok((None, warnings)) => (warnings.into_iter().next().unwrap_or_else(|| "Aucune parole trouvée".into()), false),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => ("La resynchronisation a échoué".into(), false),
+            Err(()) => ("La resynchronisation a échoué".into(), false),
         };
+        self.resync_status = None;
         self.resync_rx = None;
         if !msg.1 {
             // Échec : bandeau d'avertissement en haut de l'écran.
@@ -1130,7 +1171,14 @@ impl App {
             open_editor = th::secondary(ui, "Corriger…").on_hover_text("Corriger le texte des paroles").clicked();
             if resyncing {
                 ui.spinner();
-                ui.label(th::t("Synchronisation…", 13.0, W::Bold, th::MUTED));
+                // Étape en cours (téléchargement du modèle au premier usage, calcul…).
+                let label = match &self.resync_status {
+                    Some((s, Some(p))) if s.starts_with("Téléchargement") => format!("Modèle d'alignement… {:.0} %", p * 100.0),
+                    Some((_, Some(p))) => format!("Alignement… {:.0} %", p * 100.0),
+                    _ => "Synchronisation…".to_string(),
+                };
+                ui.label(th::t(label, 13.0, W::Bold, th::MUTED))
+                    .on_hover_text(self.resync_status.as_ref().map_or(String::new(), |s| s.0.clone()));
             } else {
                 // Après une réussite, le bouton l'indique quelques secondes.
                 let done = self.resync_msg.as_ref().filter(|m| m.1 && m.2.elapsed().as_secs() < 6);
@@ -1185,7 +1233,7 @@ impl App {
             self.start_export(ctx.clone());
         }
         if do_resync {
-            self.start_resync(ctx.clone());
+            self.start_resync(ctx.clone(), None);
         }
         if self.player.as_ref().is_some_and(|p| p.is_playing()) {
             ctx.request_repaint();
@@ -1271,27 +1319,10 @@ impl App {
         }
 
         if apply {
-            if let (Some(p), Some(text)) = (&mut self.player, &self.lyrics_editor) {
-                let mut lines = karaoke::lyrics::parse_text(text);
-                let old = p.lyrics.clone().unwrap_or_default();
-                let synced = lines.iter().any(|l| l.start.is_some());
-                if !synced && lines.len() == old.lines.len() {
-                    for (l, o) in lines.iter_mut().zip(&old.lines) {
-                        l.start = Some(o.start());
-                    }
-                }
-                let dir = p.path.parent().map(PathBuf::from).unwrap_or_default();
-                let (language, recognized) =
-                    karaoke::lyrics::read_whisper(&dir.join(karaoke::lyrics::WHISPER_JSON), &old.language).unwrap_or_default();
-                let new = karaoke::lyrics::Lyrics {
-                    language: if language.is_empty() { old.language } else { language },
-                    lines: karaoke::align::align(&lines, &recognized, p.duration()),
-                    offset: old.offset,
-                    source: "texte corrigé".into(),
-                };
-                let _ = new.save(&dir.join(pipeline::LYRICS_FILE));
-                p.lyrics = Some(new);
-                self.show_lyrics = true;
+            // Le texte corrigé est aligné en arrière-plan (alignement forcé sur la voix),
+            // comme une resynchronisation.
+            if let Some(text) = self.lyrics_editor.clone() {
+                self.start_resync(ctx.clone(), Some(text));
             }
         }
         if apply || cancel {

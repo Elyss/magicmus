@@ -157,6 +157,51 @@ pub fn ensure_whisper(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<Whi
     Ok(Whisper { cli, model, vad })
 }
 
+/// Modèle d'alignement forcé (Meta MMS-300M, conversion ONNX fp16 de
+/// MahmoudAshraf/mms-300m-1130-forced-aligner). Licence CC-BY-NC 4.0 : usage non commercial.
+const ALIGNER_URL: &str = "https://huggingface.co/tatsu020/mms-300m-fa-onnx/resolve/main/mms_300m_fa_fp16.onnx";
+const ALIGNER_FILE: &str = "mms_300m_fa_fp16.onnx";
+const ALIGNER_SHA256: &str = "9823aa1e22dfc91fe1b1185ead5db5cab4512ce604ed18459b17a9eb92a00cd2";
+
+/// Chemin du modèle d'alignement forcé, téléchargé et vérifié au premier usage.
+pub fn ensure_aligner(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<PathBuf> {
+    let path = models_dir().join(ALIGNER_FILE);
+    if path.is_file() {
+        return Ok(path);
+    }
+    fs::create_dir_all(models_dir())?;
+    let tmp = models_dir().join(format!("{ALIGNER_FILE}.verif"));
+    download(ALIGNER_URL, &tmp, "modèle d'alignement des paroles (≈ 630 Mo, une seule fois)", progress)?;
+    progress("Vérification du modèle d'alignement", None);
+    let digest = sha256_file(&tmp)?;
+    if digest != ALIGNER_SHA256 {
+        let _ = fs::remove_file(&tmp);
+        bail!("modèle d'alignement corrompu (empreinte inattendue) : réessayez");
+    }
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Le modèle d'alignement est-il déjà présent (pas de téléchargement) ?
+pub fn aligner_present() -> bool {
+    models_dir().join(ALIGNER_FILE).is_file()
+}
+
 /// Chemin du modèle d'IA, téléchargé au premier usage.
 pub fn ensure_model(progress: &mut dyn FnMut(&str, Option<f32>)) -> Result<PathBuf> {
     // Un modèle posé à côté de l'exe (version hors ligne) est prioritaire.

@@ -1,4 +1,4 @@
-﻿//! Alignement des paroles exactes (base en ligne ou texte collé) sur les mots
+//! Alignement des paroles exactes (base en ligne ou texte collé) sur les mots
 //! horodatés reconnus par Whisper.
 //!
 //! Les deux suites de mots sont alignées par programmation dynamique (Needleman-Wunsch)
@@ -14,9 +14,43 @@ pub struct TextLine {
     pub text: String,
 }
 
+/// Compteurs du dernier alignement (diagnostic, voir `examples/diag_paroles.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct AlignStats {
+    pub words: usize,
+    /// Mots exacts appariés à un mot reconnu.
+    pub matched: usize,
+    /// Appariements écartés ensuite : mot en arrière du précédent, trop tard, trop tôt.
+    pub rejected_backwards: usize,
+    pub rejected_late: usize,
+    pub rejected_early: usize,
+}
+
+thread_local! {
+    static STATS: std::cell::RefCell<AlignStats> = std::cell::RefCell::new(AlignStats::default());
+    static LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Diagnostic : rétablit l'ancien placement des mots non reconnus (tassés au début
+/// de leur intervalle), pour le comparer au nouveau.
+pub fn set_legacy_placement(on: bool) {
+    LEGACY.with(|l| l.set(on));
+}
+
+/// Compteurs du dernier appel à [`align`] sur ce fil.
+pub fn last_stats() -> AlignStats {
+    STATS.with(|s| s.borrow().clone())
+}
+
 /// Construit les lignes horodatées mot à mot.
 /// `recognized` : mots reconnus (peut être vide) ; `end_of_song` : durée du morceau.
 pub fn align(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Line> {
+    align_with(text, recognized, end_of_song, &[])
+}
+
+/// Comme [`align`], en plaçant les mots non reconnus sur les attaques de la voix
+/// (`onsets` : instants croissants, voir `vocal::onsets`).
+pub fn align_with(text: &[TextLine], recognized: &[Word], end_of_song: f64, onsets: &[f64]) -> Vec<Line> {
     // Les heures LRC sont d'abord recalées sur la voix réellement entendue.
     let recalibrated;
     let text = if !recognized.is_empty() && text.iter().any(|l| l.start.is_some()) {
@@ -25,12 +59,12 @@ pub fn align(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Li
     } else {
         text
     };
-    let mut lines = align_inner(text, recognized, end_of_song);
+    let mut lines = align_inner(text, recognized, end_of_song, onsets);
     enforce_order(&mut lines);
     lines
 }
 
-fn align_inner(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<Line> {
+fn align_inner(text: &[TextLine], recognized: &[Word], end_of_song: f64, onsets: &[f64]) -> Vec<Line> {
     // Vers non vides ; un vers vide horodaté marque la fin du précédent (pause).
     struct V {
         start: Option<f64>,
@@ -60,6 +94,7 @@ fn align_inner(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<
     }
     let rec_norm: Vec<String> = recognized.iter().map(|w| normalize(&w.text)).collect();
     let pairs = needleman_wunsch(&flat, recognized, &rec_norm);
+    STATS.with(|s| *s.borrow_mut() = AlignStats { words: flat.len(), matched: pairs.len(), ..Default::default() });
 
     // Horodatages connus (mots appariés).
     let mut times: Vec<Option<(f64, f64)>> = vec![None; flat.len()];
@@ -90,7 +125,7 @@ fn align_inner(text: &[TextLine], recognized: &[Word], end_of_song: f64) -> Vec<
         let lo = v.start.unwrap_or(prev_end).max(prev_end);
         let hi = v.limit.unwrap_or(next_start).min(next_start).max(lo + 0.3);
 
-        let words = fill(&v.words, &known, lo, hi, prev_end, v.start.is_some());
+        let words = fill(&v.words, &known, lo, hi, prev_end, v.start.is_some(), onsets);
         prev_end = words.last().map_or(prev_end, |w| w.end);
         lines.push(Line { words });
     }
@@ -163,7 +198,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// Garantit que les mots se suivent : chaque mot commence après le précédent et se
 /// termine au plus tard au début du suivant (sinon plusieurs mots « s'allument » en
 /// même temps).
-fn enforce_order(lines: &mut [Line]) {
+pub fn enforce_order(lines: &mut [Line]) {
     const MIN: f64 = 0.08;
     let mut words: Vec<&mut Word> = lines.iter_mut().flat_map(|l| l.words.iter_mut()).collect();
     for k in 1..words.len() {
@@ -193,7 +228,9 @@ fn fill(
     hi: f64,
     floor: f64,
     anchored_start: bool,
+    onsets: &[f64],
 ) -> Vec<Word> {
+    let legacy = LEGACY.with(|l| l.get());
     let n = words.len();
     let weight: Vec<f64> = words.iter().map(|w| (w.chars().filter(|c| c.is_alphanumeric()).count() as f64).max(1.0)).collect();
     let est = |a: usize, b: usize| -> f64 { weight[a..b].iter().map(|w| (w * 0.075).clamp(0.22, 0.9)).sum() };
@@ -205,15 +242,30 @@ fn fill(
     let mut last = floor - 0.01;
     for x in t.iter_mut() {
         if let Some((s, e)) = *x {
-            if s < last - 0.05 || s > hi + 0.5 || (anchored_start && s < lo - 1.6) {
+            let backwards = s < last - 0.05;
+            let late = s > hi + 0.5;
+            let early = anchored_start && s < lo - 1.6;
+            if backwards || late || early {
+                STATS.with(|st| {
+                    let mut st = st.borrow_mut();
+                    if backwards {
+                        st.rejected_backwards += 1;
+                    } else if late {
+                        st.rejected_late += 1;
+                    } else {
+                        st.rejected_early += 1;
+                    }
+                });
                 *x = None;
             } else {
                 last = e.max(s);
             }
         }
     }
-    if anchored_start && t.first().is_some_and(|x| x.is_none()) {
-        // le premier mot commence au début LRC
+    // Premier mot non reconnu d'un vers LRC : sans attaques de la voix, il commence à
+    // l'heure LRC ; avec, il sera calé sur une attaque proche (voir plus bas).
+    let lead_onsets = !legacy && onsets.iter().any(|&o| o >= lo - 1.0 && o < hi);
+    if anchored_start && !lead_onsets && t.first().is_some_and(|x| x.is_none()) {
         let e = lo + est(0, 1);
         t[0] = Some((lo, e.min(hi)));
     }
@@ -237,16 +289,59 @@ fn fill(
         let left = if i == 0 { lo } else { out[i - 1].1.min(right).max(out[i - 1].0 + 0.08) };
         let gap = (right - left).max(0.05);
         let need = est(i, j);
-        // Début de vers sans repère : les mots mènent au mot suivant (alignés à droite) ;
-        // sinon ils suivent le mot précédent (alignés à gauche).
+        let total: f64 = weight[i..j].iter().sum();
+
+        // 1. Attaques de la voix : chaque mot prend l'attaque la plus proche de sa
+        //    position attendue (dans l'ordre, sans en sauter une nécessaire à la suite).
+        //    Utile en début de vers et dans les intervalles longs ; entre deux mots
+        //    reconnus proches, la répartition simple est plus juste (banc d'essai).
+        let use_onsets = i == 0 || j == n || gap > need * 2.0;
+        if !legacy && use_onsets {
+            let from = if i == 0 && anchored_start { left - 1.0 } else { left - 0.05 };
+            let from = from.max(floor);
+            let cands: Vec<f64> = onsets.iter().copied().filter(|&o| o >= from && o <= right - 0.08).collect();
+            let k = j - i;
+            if cands.len() >= k {
+                let span_lo = cands[0].min(left);
+                let mut acc = 0.0;
+                let mut idx = 0;
+                let mut chosen = Vec::with_capacity(k);
+                for m in 0..k {
+                    let target = span_lo + (right - span_lo) * acc / total;
+                    acc += weight[i + m];
+                    let last_ok = cands.len() - (k - m);
+                    let best = (idx..=last_ok)
+                        .min_by(|&a, &b| (cands[a] - target).abs().total_cmp(&(cands[b] - target).abs()))
+                        .unwrap_or(idx);
+                    chosen.push(cands[best]);
+                    idx = best + 1;
+                }
+                for m in 0..k {
+                    let s = chosen[m];
+                    let e = chosen.get(m + 1).copied().unwrap_or(right).min(s + 1.5);
+                    out[i + m] = (s, e);
+                }
+                i = j;
+                continue;
+            }
+        }
+
+        // 2. Sans attaques : répartition dans l'intervalle.
         let (start, span) = if need >= gap {
             (left, gap)
-        } else if i == 0 && j < n && !anchored_start {
-            (right - need, need)
+        } else if legacy {
+            // Ancien placement : tassés au début (sauf début de vers non LRC).
+            if i == 0 && j < n && !anchored_start { (right - need, need) } else { (left, need) }
+        } else if j < n && gap <= need * 3.0 {
+            // Encadrés par deux mots reconnus proches : ils occupent tout l'intervalle
+            // (les mots chantés durent plus longtemps que parlés).
+            (left, gap)
+        } else if i == 0 && j < n {
+            // Long silence avant le mot suivant : les mots y mènent.
+            (right - need * 1.5, need * 1.5)
         } else {
-            (left, need)
+            (left, (need * 1.5).min(gap))
         };
-        let total: f64 = weight[i..j].iter().sum();
         let mut cur = start;
         for k in i..j {
             let d = span * weight[k] / total;

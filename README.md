@@ -48,6 +48,7 @@ dans `%LOCALAPPDATA%\Karaoke` (environ 300 Mo, une seule fois) :
 | ffmpeg / ffprobe / ffplay | décodage, encodage et lecture |
 | ONNX Runtime (Microsoft) | moteur d'exécution du réseau de neurones |
 | Modèle UVR-MDX-NET Inst HQ 3 | réseau de neurones de séparation voix / musique |
+| Modèle MMS-300M (≈ 630 Mo, au premier recalage des paroles) | alignement de chaque mot sur la voix |
 
 Si un outil est déjà installé sur la machine (dans le PATH), il est utilisé tel quel. Si une vidéo ne se télécharge
 plus, l'application met automatiquement yt-dlp à jour.
@@ -68,11 +69,22 @@ Le karaoké se lit dans la fenêtre :
   2. de la base libre en ligne [LRCLIB](https://lrclib.net) (paroles officielles, horodatées vers par vers) ;
   3. à défaut, de la reconnaissance vocale.
 
-  Le minutage mot à mot vient de la voix isolée, transcrite par Whisper (whisper.cpp, modèle large-v3-turbo,
-  ≈ 550 Mo au premier usage) : les mots exacts sont alignés sur les mots entendus (`src/align.rs`).
+  Le minutage mot à mot vient d'un **alignement forcé** (`src/forced.rs`) : le modèle Meta MMS-300M (≈ 630 Mo au
+  premier usage) calcule, toutes les 20 ms, la probabilité de chaque lettre dans la voix isolée, puis l'algorithme de
+  Viterbi place chaque mot des paroles exactes à l'endroit où ses lettres sont entendues. Sur de la parole de synthèse
+  dont l'heure de chaque mot est connue, l'écart médian mesuré est de 0,03 s (anglais) à 0,07 s (français).
+  Un symbole « joker » entre les vers absorbe la voix absente du texte (chœurs, rires, répétitions), et chaque vers
+  est cherché à ±4 s de la place que lui donnent les heures LRCLIB recalées sur les mots reconnus par Whisper.
+  Méthode de secours (modèle indisponible, ou résultat trop éloigné du minutage LRCLIB) : transcription par Whisper
+  (whisper.cpp, modèle large-v3-turbo, ≈ 550 Mo) et alignement des mots exacts sur les mots reconnus (`src/align.rs`).
+
+  **Licence du modèle d'alignement** : MMS est publié par Meta sous licence CC-BY-NC 4.0, qui **interdit l'usage
+  commercial**. Pour une diffusion commerciale de MagicMus, il faudrait le remplacer (par exemple par un modèle
+  wav2vec2 sous licence libre, avec un alphabet propre à chaque langue).
 - **Corriger les paroles** : bouton « Corriger… » dans le lecteur ; le texte corrigé est recalé automatiquement.
   Le réglage **Décalage** avance ou retarde l'ensemble des paroles. **Resynchroniser** recale en une seconde les
-  paroles d'un morceau déjà créé sur la voix entendue (sans relancer la reconnaissance vocale).
+  paroles d'un morceau déjà créé sur la voix entendue (sans relancer la reconnaissance vocale ; environ 30 s la
+  première fois, le temps d'analyser la voix, puis quelques secondes grâce à `emissions.bin`).
 - **Tonalité** (−12 à +12 demi-tons) et **vitesse** (50 à 150 %) se règlent pendant la lecture, sans que l'une modifie
   l'autre (Signalsmith Stretch, intégré dans `vendor/signalsmith`).
 - **Enregistrer…** : crée un fichier avec la tonalité et la vitesse actuelles, et les paroles karaoké incrustées dans la
@@ -117,7 +129,9 @@ On obtient `target/release/karaoke.exe` (interface graphique) et `target/release
 | `src/player.rs` | lecteur intégré : son (cpal), image (ffmpeg), paroles |
 | `src/lyrics.rs` | transcription Whisper, lignes, sous-titres ASS karaoké |
 | `src/lrclib.rs` | recherche des paroles officielles (LRCLIB) |
-| `src/align.rs` | alignement des paroles exactes sur les mots reconnus |
+| `src/forced.rs` | alignement forcé des paroles sur la voix (MMS, CTC + Viterbi) |
+| `src/align.rs` | alignement de secours des paroles exactes sur les mots reconnus par Whisper |
+| `src/vocal.rs` | attaques de la voix isolée (placement des mots non reconnus, méthode de secours) |
 | `src/stretch.rs` | tonalité / vitesse (liaison vers Signalsmith Stretch) |
 | `src/export.rs` | enregistrement avec tonalité, vitesse et paroles incrustées |
 | `src/bin/karaoke-cli.rs` | ligne de commande |

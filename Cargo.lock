@@ -2086,6 +2086,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
  "windows-sys 0.61.2",
  "winresource",

@@ -265,6 +265,8 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
         if let Some(whisper) = whisper {
             emit(Event::Stage("Reconnaissance des paroles".into()));
             let vocals: Vec<f32> = pcm.iter().zip(&processed).map(|(m, i)| m - i).collect();
+            // Attaques de la voix, pour placer les mots que Whisper ne transcrira pas.
+            crate::vocal::save(&work_dir, &crate::vocal::onsets(&vocals, media::SAMPLE_RATE));
             match lyrics::transcribe(&whisper, &vocals, media::SAMPLE_RATE, &work_dir, &o.language, &mut |p| {
                 emit(Event::Progress(p))
             }) {
@@ -294,6 +296,7 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Event)) -> Result<Outcome> {
             language: &o.language,
             user_text: user_text.then_some(o.lyrics_text.as_str()),
             online: o.lyrics_online,
+            karaoke: Some(&output),
         };
         if let Some(ly) = build_lyrics(&req, emit) {
             ly.save(&lyrics_path)?;
@@ -322,6 +325,8 @@ pub struct LyricsRequest<'a> {
     pub user_text: Option<&'a str>,
     /// Chercher les paroles exactes dans LRCLIB.
     pub online: bool,
+    /// Fichier karaoké (pour calculer les attaques de la voix si elles manquent).
+    pub karaoke: Option<&'a Path>,
 }
 
 /// Paroles finales : texte exact (saisi, sinon trouvé en ligne) aligné sur la voix
@@ -356,28 +361,57 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
     };
 
     let text_synced = text.as_ref().is_some_and(|t| t.iter().any(|l| l.start.is_some()));
-    let result = match text {
-        // Texte exact : horodaté (LRC) ou calé sur la reconnaissance.
-        Some(t) if text_synced || !recognized.is_empty() => Some(Lyrics {
-            language: language.clone(),
-            lines: align::align(&t, &recognized, r.duration),
-            offset: 0.0,
-            source: short.into(),
-        }),
-        Some(_) => {
+    // Texte à aligner : paroles exactes, sinon le texte reconnu par Whisper.
+    let (text, source) = match text {
+        Some(t) => (Some(t), short),
+        None if !recognized.is_empty() => (
+            Some(
+                lyrics::group_lines(recognized.clone())
+                    .iter()
+                    .map(|l| align::TextLine { start: Some(l.start()), text: l.text() })
+                    .collect(),
+            ),
+            "reconnaissance vocale",
+        ),
+        None => (None, short),
+    };
+    let lyrics_of = |lines| Lyrics { language: language.clone(), lines, offset: 0.0, source: source.into() };
+
+    let Some(t) = text else {
+        emit(Event::Warning("Aucune parole disponible pour ce morceau.".into()));
+        return None;
+    };
+
+    // Méthode de secours : mots reconnus par Whisper + attaques de la voix.
+    let onsets = r.karaoke.map(|k| crate::vocal::load_or_compute(r.work_dir, k)).unwrap_or_default();
+    let fallback = (text_synced || !recognized.is_empty()).then(|| align::align_with(&t, &recognized, r.duration, &onsets));
+
+    // Méthode principale : alignement forcé de chaque mot sur la voix (MMS). Le résultat
+    // de secours sert de guide (fenêtre de recherche de chaque vers) quand il s'appuie
+    // sur assez de mots réellement entendus par Whisper.
+    let anchored = fallback.as_ref().map_or(0, |fb| {
+        fb.iter()
+            .flat_map(|l| l.words.iter())
+            .filter(|w| recognized.iter().any(|r| (r.start - w.start).abs() < 1e-6))
+            .count()
+    });
+    let guide = fallback.as_deref().filter(|_| anchored >= MIN_GUIDE_ANCHORS);
+    let forced = r.karaoke.and_then(|k| forced_align(r.work_dir, k, &t, guide, emit));
+    let result = match (forced, fallback) {
+        (Some(f), Some(fb)) if agrees(&f, &fb) => Some(lyrics_of(f)),
+        (Some(_), Some(fb)) => {
+            emit(Event::Log("Alignement forcé trop éloigné du minutage des paroles : méthode de secours".into()));
+            Some(lyrics_of(fb))
+        }
+        (Some(f), None) => Some(lyrics_of(f)),
+        (None, Some(fb)) => Some(lyrics_of(fb)),
+        (None, None) => {
             emit(Event::Warning(
                 "Paroles trouvées sans minutage et reconnaissance vocale indisponible : impossible de les synchroniser."
                     .into(),
             ));
             None
         }
-        None if !recognized.is_empty() => Some(Lyrics {
-            language: language.clone(),
-            lines: lyrics::group_lines(recognized),
-            offset: 0.0,
-            source: "reconnaissance vocale".into(),
-        }),
-        None => None,
     };
     match result.filter(|l| !l.lines.is_empty()) {
         Some(ly) => {
@@ -389,6 +423,49 @@ pub fn build_lyrics(r: &LyricsRequest, emit: &mut dyn FnMut(Event)) -> Option<Ly
             None
         }
     }
+}
+
+/// Alignement forcé (MMS) : télécharge le modèle au premier usage, calcule ou relit
+/// les émissions de la voix, puis aligne chaque mot. `None` en cas d'échec.
+fn forced_align(
+    work_dir: &Path,
+    karaoke: &Path,
+    text: &[align::TextLine],
+    guide: Option<&[lyrics::Line]>,
+    emit: &mut dyn FnMut(Event),
+) -> Option<Vec<lyrics::Line>> {
+    let res = (|| -> Result<Option<Vec<lyrics::Line>>> {
+        let runtime = setup::ensure_onnxruntime(&mut setup_reporter(emit))?;
+        let model = setup::ensure_aligner(&mut setup_reporter(emit))?;
+        emit(Event::Stage("Alignement des paroles sur la voix".into()));
+        let em = crate::forced::load_or_compute(work_dir, karaoke, &runtime, &model, &mut |p| {
+            emit(Event::Progress(p))
+        })?;
+        Ok(crate::forced::align_lines(text, &em, guide))
+    })();
+    match res {
+        Ok(lines) => lines,
+        Err(e) => {
+            emit(Event::Log(format!("Alignement forcé indisponible : {e:#}")));
+            None
+        }
+    }
+}
+
+/// Garde-fou : l'alignement forcé et la méthode de secours doivent placer la plupart
+/// des vers au même endroit (sinon le texte ne correspond sans doute pas à la version
+/// chantée, et l'alignement forcé a pu se perdre).
+/// Nombre minimal de mots reconnus par Whisper dans le résultat de secours pour qu'il
+/// guide l'alignement forcé.
+const MIN_GUIDE_ANCHORS: usize = 10;
+
+fn agrees(forced: &[lyrics::Line], fallback: &[lyrics::Line]) -> bool {
+    let n = forced.len().min(fallback.len());
+    if n == 0 {
+        return false;
+    }
+    let far = forced.iter().zip(fallback).filter(|(a, b)| (a.start() - b.start()).abs() > 2.5).count();
+    far * 10 <= n * 3
 }
 
 fn spectral(o: &Options, pcm: &[f32], emit: &mut dyn FnMut(Event)) -> Vec<f32> {

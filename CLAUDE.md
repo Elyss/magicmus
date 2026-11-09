@@ -51,13 +51,15 @@ identifiée, aussi sans le mode démo) : tester avec `--release`.
 | `src/dsp.rs` | méthode « rapide » : masque spectral du canal central |
 | `src/lyrics.rs` | Whisper (whisper.cpp `-ml 1 -sow`), lignes, sous-titres ASS `\kf` |
 | `src/lrclib.rs` | paroles officielles synchronisées (LRCLIB) |
-| `src/align.rs` | alignement Needleman-Wunsch des paroles exactes sur les mots reconnus |
+| `src/forced.rs` | alignement forcé MMS (émissions CTC via `ort`, Viterbi), méthode principale du minutage |
+| `src/align.rs` | secours : alignement Needleman-Wunsch des paroles exactes sur les mots reconnus par Whisper |
+| `src/vocal.rs` | attaques de la voix isolée (`attaques.json`) |
 | `src/player.rs` | lecteur : cpal + Signalsmith (tonalité/vitesse), frames vidéo ffmpeg, rendu des paroles, bascule voix originale |
 | `src/export.rs` | rendu final : tonalité/vitesse, `setpts`, paroles incrustées (`ass`) |
 | `src/tools.rs` | lancement des outils sans console, PATH, lecture de progression |
 
 Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `karaoke_rapide.mp4`, `whisper.json`
-(résultat brut, réutilisé pour réaligner), `paroles.json`, `titre.txt`, `source.txt`.
+(résultat brut, réutilisé pour réaligner), `paroles.json`, `attaques.json`, `emissions.bin` (sorties MMS, ≈ 0,4 Mo par minute), `titre.txt`, `source.txt`.
 
 ## Décisions et contraintes
 
@@ -65,9 +67,31 @@ Dossier de travail d'une chanson : `source.*` (original), `karaoke_ia.mp4` / `ka
   dépendance système (Python, etc.).
 - ONNX Runtime en `load-dynamic` : la version statique pour Windows inclut DirectML et exige `DXCORE.lib`, absent du
   SDK Windows 10.0.18362 installé.
-- Paroles : texte saisi > LRCLIB > reconnaissance Whisper seule ; le minutage mot à mot vient de Whisper.
-  Construction dans `pipeline::build_lyrics` (utilisée par le traitement et par le bouton « Resynchroniser »,
-  qui ne relance pas Whisper : il relit `whisper.json`).
+- Paroles : texte saisi > LRCLIB > reconnaissance Whisper seule. Construction dans `pipeline::build_lyrics`
+  (utilisée par le traitement, le bouton « Resynchroniser » et « Appliquer » de la correction ; ne relance pas
+  Whisper : relit `whisper.json`).
+- Minutage mot à mot : **alignement forcé MMS** (`src/forced.rs`, `setup::ensure_aligner`) — modèle ONNX fp16
+  `tatsu020/mms-300m-fa-onnx` (CC-BY-NC 4.0, non commercial, signalé dans le README), entrée 16 kHz mono de la voix
+  isolée (source − karaoké), sortie log-probabilités par trame de 20 ms sur 31 symboles (0 = vide, 4..30 = a–z et
+  apostrophe ; accents retirés), fenêtres de 15 s + 1 s de contexte, Viterbi CTC avec un **joker** gratuit entre
+  les vers (absorbe chœurs, rires, répétitions absentes du texte). **Guide** : si le résultat de secours contient
+  au moins 10 mots entendus par Whisper (`MIN_GUIDE_ANCHORS`), chaque vers est cherché à ±4 s de sa place
+  (`GUIDE_MARGIN_S`) ; sans guide, MMS se trompait de plusieurs dizaines de secondes sur Feel Good Inc. (LRC d'une
+  autre version, décalée de 17 à 40 s, et Whisper muet sur les 90 premières secondes). Résultat en cache dans
+  `emissions.bin`. Garde-fou `pipeline::agrees` : si plus de 30 % des vers démarrent à plus de 2,5 s de la méthode
+  de secours (Whisper + `align.rs`), c'est la méthode de secours qui est retenue.
+- Exactitude vérifiée sur parole de synthèse (System.Speech, heure exacte de chaque mot) :
+  `cargo run --release --example diag_paroles -- --tts <wav 16 kHz> <json {text, words:[{text,start}]}>` →
+  écart médian 0,03 s (en), 0,065 s (fr), toujours en retard, 100 % / 98 % ≤ 0,2 s. Sur chant, MMS place les mots
+  en moyenne 0,24 s après Whisper (dont les heures de jetons sont moins fiables) : pas de vérité terrain sur chant.
+  Test de robustesse : `tts_extra.ps1` (scratchpad, non versionné) fait dire des phrases absentes du texte ;
+  pire mot 3,9 s → 1,4 s (fr) et 1,2 s → 0,11 s (en) grâce au joker. `--mms --lignes` : relevé par vers ;
+  `--libre` : sans guide.
+  `--ecrire` refait paroles.json d'une chanson comme « Resynchroniser » (sauvegarde `paroles.avant-mms.json`).
+- Whisper ne transcrit qu'environ 60 % des mots chantés (interjections, mots courts, répétitions manquent). Les mots
+  non reconnus sont placés sur les **attaques de la voix** (`src/vocal.rs`, montées d'énergie de la voix isolée,
+  conservées dans `attaques.json`) en début de vers et dans les longs intervalles, sinon répartis dans l'intervalle.
+  Réglages choisis au banc d'essai à mots masqués : `cargo run --release --example diag_paroles -- <dossier> --banc debut|suites [--seuils]`.
 - Les heures LRCLIB viennent souvent d'une autre version du morceau : `align::recalibrate` mesure l'écart
   (voix entendue − LRC) vers par vers et le lisse avant l'alignement ; `enforce_order` interdit mots désordonnés
   et chevauchements (sinon plusieurs mots « s'allument » en même temps).
